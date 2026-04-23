@@ -64,6 +64,15 @@ export function serializeToolPayload(payload: unknown): string | undefined {
   if (typeof payload === "number" || typeof payload === "boolean") {
     return String(payload);
   }
+  // Upfront guard for the common "huge binary tool result" shape — Buffer,
+  // Node Buffer, and typed arrays. These expand dramatically under
+  // `JSON.stringify` (a Node Buffer's `toJSON()` returns an array of
+  // byte-sized numbers whose serialized form is ~6x the raw byte length).
+  // Bail early rather than relying on the replacer to trip mid-allocation.
+  const directSize = estimateDirectByteSize(payload);
+  if (directSize !== undefined && directSize > TOOL_PAYLOAD_RAW_MAX_BYTES) {
+    return buildTruncatedPlaceholder();
+  }
   return stringifyWithSizeGuard(payload);
 }
 
@@ -131,6 +140,27 @@ function stringifyWithSizeGuard(payload: unknown): string {
 
 function buildTruncatedPlaceholder(): string {
   return `[truncated: raw payload exceeds ${TOOL_PAYLOAD_RAW_MAX_BYTES} bytes]`;
+}
+
+// Best-effort byte-size estimate for payloads whose serialized JSON form
+// would dwarf their in-memory footprint. We handle Node `Buffer`,
+// `ArrayBuffer`, `SharedArrayBuffer`, and typed arrays explicitly;
+// everything else returns `undefined` and falls back to the replacer-based
+// guard inside `stringifyWithSizeGuard`.
+function estimateDirectByteSize(payload: unknown): number | undefined {
+  if (Buffer.isBuffer(payload)) {
+    // `toJSON()` produces `{ type: "Buffer", data: [n, n, ...] }` — the
+    // serialized form is roughly ~6 bytes per source byte (number + comma +
+    // spaces). We use 2x as a conservative lower bound for early rejection.
+    return payload.byteLength * 2;
+  }
+  if (payload instanceof ArrayBuffer || payload instanceof SharedArrayBuffer) {
+    return payload.byteLength * 2;
+  }
+  if (ArrayBuffer.isView(payload)) {
+    return payload.byteLength * 2;
+  }
+  return undefined;
 }
 
 class RawPayloadTooLargeError extends Error {

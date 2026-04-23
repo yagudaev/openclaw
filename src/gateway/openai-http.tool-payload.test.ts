@@ -97,6 +97,27 @@ describe("serializeToolPayload", () => {
     expect(out).toMatch(/^\[truncated:/);
   });
 
+  test("size-guards huge Buffer payloads before JSON.stringify", () => {
+    // Node Buffer.toJSON() expands a Buffer into { type, data: [...] }
+    // where each byte becomes an integer in the array — the serialized
+    // form is ~6 bytes per source byte. A 2 MiB buffer would allocate
+    // multiple MiB under JSON.stringify. Upfront byte-size guard must
+    // reject before serialization.
+    const huge = Buffer.alloc(2 * 1024 * 1024);
+    const out = serializeToolPayload(huge);
+    expect(out).toBeDefined();
+    expect(out!.length).toBeLessThan(200);
+    expect(out).toMatch(/^\[truncated:/);
+  });
+
+  test("size-guards huge typed-array payloads before JSON.stringify", () => {
+    const huge = new Uint8Array(2 * 1024 * 1024);
+    const out = serializeToolPayload(huge);
+    expect(out).toBeDefined();
+    expect(out!.length).toBeLessThan(200);
+    expect(out).toMatch(/^\[truncated:/);
+  });
+
   test("size-guards payloads with huge object keys", () => {
     // Key strings can also be arbitrarily large. A 2 MiB key must trip the
     // guard even though the value is tiny — otherwise a malicious caller
