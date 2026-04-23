@@ -626,6 +626,12 @@ export function handleToolExecutionStart(
       meta,
       toolCallId,
       startedAt,
+      // Capture raw tool arguments at start. The gateway serializes this onto
+      // the item span as `gen_ai.tool.input` so observability backends can see
+      // per-call arguments — vital for tools called multiple times in a run
+      // (e.g. four `mcp__openclaw__browser` calls that would otherwise be
+      // indistinguishable from metadata alone).
+      input: args,
     };
     emitTrackedItemEvent(ctx, itemData);
     // Best-effort typing signal; do not block tool summaries on slow emitters.
@@ -907,6 +913,10 @@ export async function handleToolExecutionEnd(
     toolCallId,
     startedAt: startData?.startTime,
     endedAt,
+    // Capture the sanitized tool result so the gateway can emit it as
+    // `gen_ai.tool.output` on the item span. Pair with the `input` captured
+    // at start to make per-call inspection possible in traces.
+    output: sanitizedResult,
     ...(isToolError && extractToolErrorMessage(sanitizedResult)
       ? { error: extractToolErrorMessage(sanitizedResult) }
       : {}),

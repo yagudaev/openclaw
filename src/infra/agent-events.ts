@@ -42,6 +42,15 @@ export type AgentItemEventData = {
   progressText?: string;
   approvalId?: string;
   approvalSlug?: string;
+  // Raw tool call input (arguments) captured at the `start` phase. Serialized
+  // onto the item span as `gen_ai.tool.input` by the gateway so observability
+  // backends see what each tool call actually asked — a `mcp__browser` trace
+  // with four identical names is useless without the per-call arguments.
+  input?: unknown;
+  // Raw tool call result captured at the `end` phase. Serialized onto the
+  // item span as `gen_ai.tool.output`. Distinct from `summary`, which is
+  // already a human-readable one-liner for UI surfaces.
+  output?: unknown;
 };
 
 export type AgentPlanEventData = {

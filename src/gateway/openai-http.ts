@@ -1065,9 +1065,13 @@ function handleItemEvent(params: {
           // OTel GenAI semantic conventions — also makes the span eligible for
           // LangfuseSpanProcessor's default `shouldExportSpan` filter (which
           // only exports spans carrying `gen_ai.*` attrs or coming from the
-          // Langfuse tracer scope).
+          // Langfuse tracer scope). We deliberately emit vendor-neutral
+          // `gen_ai.*` attrs for new data; `langfuse.*` attrs stay only where
+          // they already exist (back-compat for Langfuse ingest). No new
+          // `langfuse.*` sites going forward.
           "gen_ai.operation.name": isTool ? "execute_tool" : "workflow",
           ...(isTool && data.name ? { "gen_ai.tool.name": data.name } : {}),
+          ...(isTool && data.toolCallId ? { "gen_ai.tool.call_id": data.toolCallId } : {}),
           "langfuse.observation.type": resolveItemObservationType(data.kind),
           "openclaw.item.id": data.itemId,
           "openclaw.item.kind": data.kind,
@@ -1078,6 +1082,9 @@ function handleItemEvent(params: {
       },
       parentCtx,
     );
+    if (traceContent && isTool && data.input !== undefined) {
+      applyToolPayloadAttributes(span, "input", data.input);
+    }
     itemSpans.set(data.itemId, span);
     return;
   }
@@ -1086,16 +1093,71 @@ function handleItemEvent(params: {
     if (!span) {
       return;
     }
-    if (data.status === "failed" || data.status === "blocked") {
+    const isTool = resolveItemObservationType(data.kind) === "TOOL";
+    const isError = data.status === "failed" || data.status === "blocked";
+    if (isError) {
       span.setStatus({
         code: SpanStatusCode.ERROR,
         message: data.error ?? data.status,
       });
+      if (isTool) {
+        span.setAttribute("gen_ai.tool.error.type", data.status);
+        if (data.error) {
+          span.setAttribute("gen_ai.tool.error.message", data.error);
+        }
+      }
     }
-    if (traceContent && data.summary) {
-      span.setAttribute("langfuse.observation.output", data.summary);
+    if (traceContent) {
+      if (isTool && data.output !== undefined) {
+        applyToolPayloadAttributes(span, "output", data.output);
+      }
+      if (data.summary) {
+        span.setAttribute("langfuse.observation.output", data.summary);
+      }
     }
     span.end();
     itemSpans.delete(data.itemId);
+  }
+}
+
+// Max serialized size for `gen_ai.tool.input` / `gen_ai.tool.output` payloads.
+// Large tool results (e.g. full browser snapshots) blow past OTLP limits and
+// make span exports reject. 64 KiB is a reasonable ceiling that still captures
+// per-call distinctiveness; when we truncate we set
+// `gen_ai.tool.<slot>.truncated` so consumers know.
+const TOOL_PAYLOAD_MAX_BYTES = 64 * 1024;
+
+function applyToolPayloadAttributes(span: Span, slot: "input" | "output", payload: unknown): void {
+  const serialized = serializeToolPayload(payload);
+  if (serialized === undefined) {
+    return;
+  }
+  const truncated = serialized.length > TOOL_PAYLOAD_MAX_BYTES;
+  const value = truncated ? serialized.slice(0, TOOL_PAYLOAD_MAX_BYTES) : serialized;
+  span.setAttribute(`gen_ai.tool.${slot}`, value);
+  if (truncated) {
+    span.setAttribute(`gen_ai.tool.${slot}.truncated`, true);
+  }
+}
+
+// Best-effort serialization. Strings pass through so tool args/results that
+// are already text (e.g. stdout) do not get double-stringified. Objects are
+// JSON-encoded; circular/unserialisable payloads return a fixed sentinel
+// rather than risking `[object Object]` noise. We never throw — tracing must
+// not break the request path.
+function serializeToolPayload(payload: unknown): string | undefined {
+  if (payload === undefined || payload === null) {
+    return undefined;
+  }
+  if (typeof payload === "string") {
+    return payload;
+  }
+  if (typeof payload === "number" || typeof payload === "boolean") {
+    return String(payload);
+  }
+  try {
+    return JSON.stringify(payload);
+  } catch {
+    return "[unserializable]";
   }
 }
