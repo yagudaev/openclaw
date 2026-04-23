@@ -98,7 +98,15 @@ export function truncateUtf8(str: string, maxBytes: number): ToolPayloadAttribut
 function stringifyWithSizeGuard(payload: unknown): string {
   let running = 0;
   try {
-    const encoded = JSON.stringify(payload, (_key, value) => {
+    const encoded = JSON.stringify(payload, (key, value) => {
+      // Count both the key (object property names can be arbitrarily huge —
+      // e.g. `{ ["x".repeat(2*1024*1024)]: null }`) and the value. This is
+      // an approximation of the final JSON byte size; it ignores JSON
+      // punctuation overhead but is enough to catch payloads that would
+      // OOM `JSON.stringify`.
+      if (typeof key === "string") {
+        running += Buffer.byteLength(key, "utf8");
+      }
       if (typeof value === "string") {
         running += Buffer.byteLength(value, "utf8");
       } else if (typeof value === "number" || typeof value === "boolean") {

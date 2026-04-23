@@ -97,6 +97,17 @@ describe("serializeToolPayload", () => {
     expect(out).toMatch(/^\[truncated:/);
   });
 
+  test("size-guards payloads with huge object keys", () => {
+    // Key strings can also be arbitrarily large. A 2 MiB key must trip the
+    // guard even though the value is tiny — otherwise a malicious caller
+    // could bypass the budget by encoding their data into a JSON key.
+    const hugeKey = "k".repeat(2 * 1024 * 1024);
+    const out = serializeToolPayload({ [hugeKey]: null });
+    expect(out).toBeDefined();
+    expect(out!.length).toBeLessThan(200);
+    expect(out).toMatch(/^\[truncated:/);
+  });
+
   test("passes raw payloads just under the cap", () => {
     // 512 KiB string — under the 1 MiB raw cap but over the 64 KiB attr
     // cap. `serializeToolPayload` returns the full string; truncation
