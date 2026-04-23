@@ -6,6 +6,7 @@ Docs: https://docs.openclaw.ai
 
 ### Changes
 
+- Gateway/tracing: emit OpenTelemetry spans for `POST /v1/chat/completions` (`openclaw.chat_completions` root plus nested `openclaw.llm` generation with model and usage details) and extract the W3C `traceparent` header from incoming requests. Callers that already trace — for example, the VoiceClaw relay wrapping `ask_brain` in a tool span — see OpenClaw spans appear as children in one unified Langfuse trace. Soft-disabled when `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` are missing.
 - Providers/Amazon Bedrock Mantle: add Claude Opus 4.7 through Mantle's Anthropic Messages route with provider-owned bearer-auth streaming, so the model is actually callable without treating AWS bearer tokens like Anthropic API keys. Thanks @wirjo.
 - OpenAI/Responses: use OpenAI's native `web_search` tool automatically for direct OpenAI Responses models when web search is enabled and no managed search provider is pinned; explicit providers such as Brave keep the managed `web_search` tool.
 - ACPX: add an explicit `openClawToolsMcpBridge` option that injects a core OpenClaw MCP server for selected built-in tools, starting with `cron`.

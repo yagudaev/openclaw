@@ -1,5 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import {
+  context,
+  propagation,
+  SpanKind,
+  SpanStatusCode,
+  trace,
+  type Span,
+} from "@opentelemetry/api";
 import type { ImageContent } from "../agents/command/types.js";
 import { normalizeUsage, toOpenAiChatCompletionsUsage } from "../agents/usage.js";
 import { createDefaultDeps } from "../cli/deps.js";
@@ -496,10 +504,45 @@ function resolveIncludeUsageForStreaming(payload: OpenAiChatCompletionRequest): 
   return (streamOptions as { include_usage?: unknown }).include_usage === true;
 }
 
+const openaiCompatTracer = trace.getTracer("openclaw-gateway/openai-http");
+
 export async function handleOpenAiHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
   opts: OpenAiHttpOptions,
+): Promise<boolean> {
+  // Extract W3C trace context from the incoming request. When the caller is
+  // the voiceclaw relay the extracted context is the `ask_brain` tool span, so
+  // every span we create below nests under it — one unified trace per voice
+  // turn across both services.
+  const parentCtx = propagation.extract(context.active(), req.headers);
+  const rootSpan = openaiCompatTracer.startSpan(
+    "openclaw.chat_completions",
+    {
+      kind: SpanKind.SERVER,
+      attributes: {
+        "http.method": "POST",
+        "http.route": "/v1/chat/completions",
+        "langfuse.observation.type": "SPAN",
+      },
+    },
+    parentCtx,
+  );
+  const rootCtx = trace.setSpan(parentCtx, rootSpan);
+  // Close the span on socket close — covers the streaming path (which returns
+  // early while the SSE loop runs in the background), client disconnects, and
+  // the non-streaming finally path. OTel spans silently ignore double-end, so
+  // later explicit .end() calls are safe.
+  res.once("close", () => rootSpan.end());
+
+  return context.with(rootCtx, () => processOpenAiHttpRequest(req, res, opts, rootSpan));
+}
+
+async function processOpenAiHttpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: OpenAiHttpOptions,
+  rootSpan: Span,
 ): Promise<boolean> {
   const limits = resolveOpenAiChatCompletionsLimits(opts.config);
   const handled = await handleGatewayPostJsonEndpoint(req, res, {
@@ -529,6 +572,11 @@ export async function handleOpenAiHttpRequest(
   const streamIncludeUsage = stream && resolveIncludeUsageForStreaming(payload);
   const model = typeof payload.model === "string" ? payload.model : "openclaw";
   const user = typeof payload.user === "string" ? payload.user : undefined;
+
+  rootSpan.setAttributes({
+    "gen_ai.request.model": model,
+    "openclaw.gateway.stream": stream,
+  });
 
   const { agentId, sessionKey, messageChannel } = resolveGatewayRequestContext({
     req,
@@ -595,7 +643,11 @@ export async function handleOpenAiHttpRequest(
   if (!stream) {
     const stopWatchingDisconnect = watchClientDisconnect(req, res, abortController);
     try {
-      const result = await agentCommandFromIngress(commandInput, defaultRuntime, deps);
+      const result = await runAgentCommandWithGenerationSpan(commandInput, deps, {
+        model,
+        runId,
+        prompt: prompt.message,
+      });
 
       if (abortController.signal.aborted) {
         return true;
@@ -622,6 +674,7 @@ export async function handleOpenAiHttpRequest(
       if (abortController.signal.aborted) {
         return true;
       }
+      rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
       logWarn(`openai-compat: chat completion failed: ${String(err)}`);
       sendJson(res, 500, {
         error: { message: "internal error", type: "api_error" },
@@ -718,12 +771,19 @@ export async function handleOpenAiHttpRequest(
 
   void (async () => {
     try {
-      const result = await agentCommandFromIngress(commandInput, defaultRuntime, deps);
+      const result = await runAgentCommandWithGenerationSpan(commandInput, deps, {
+        model,
+        runId,
+        prompt: prompt.message,
+      });
 
       if (closed) {
         return;
       }
 
+      rootSpan.setAttributes({
+        "langfuse.observation.output": resolveAgentResponseText(result),
+      });
       finalUsage = resolveChatCompletionUsage(result);
 
       if (!sawAssistantDelta) {
@@ -747,6 +807,7 @@ export async function handleOpenAiHttpRequest(
       if (closed || abortController.signal.aborted) {
         return;
       }
+      rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
       logWarn(`openai-compat: streaming chat completion failed: ${String(err)}`);
       writeAssistantContentChunk(res, {
         runId,
@@ -778,4 +839,45 @@ export async function handleOpenAiHttpRequest(
   })();
 
   return true;
+}
+
+// Wraps `agentCommandFromIngress` in a Langfuse GENERATION span. Emits model,
+// prompt, and completion attributes so the downstream trace captures the LLM
+// call inside the gateway — not just the HTTP envelope.
+async function runAgentCommandWithGenerationSpan(
+  commandInput: Parameters<typeof agentCommandFromIngress>[0],
+  deps: Parameters<typeof agentCommandFromIngress>[2],
+  attrs: { model: string; runId: string; prompt: string | undefined },
+): Promise<Awaited<ReturnType<typeof agentCommandFromIngress>>> {
+  const generation = openaiCompatTracer.startSpan("openclaw.llm", {
+    attributes: {
+      "langfuse.observation.type": "GENERATION",
+      "langfuse.observation.model.name": attrs.model,
+      "gen_ai.request.model": attrs.model,
+      "openclaw.run_id": attrs.runId,
+      ...(attrs.prompt !== undefined ? { "langfuse.observation.input": attrs.prompt } : {}),
+    },
+  });
+  try {
+    const result = await context.with(trace.setSpan(context.active(), generation), () =>
+      agentCommandFromIngress(commandInput, defaultRuntime, deps),
+    );
+    const output = resolveAgentResponseText(result);
+    const usage = resolveChatCompletionUsage(result);
+    generation.setAttributes({
+      "langfuse.observation.output": output,
+      "langfuse.observation.usage_details": JSON.stringify({
+        input: usage.prompt_tokens,
+        output: usage.completion_tokens,
+        total: usage.total_tokens,
+      }),
+    });
+    return result;
+  } catch (err) {
+    generation.recordException(err as Error);
+    generation.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
+    throw err;
+  } finally {
+    generation.end();
+  }
 }
