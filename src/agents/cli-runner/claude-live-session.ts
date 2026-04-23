@@ -5,6 +5,7 @@ import {
   createCliJsonlStreamingParser,
   extractCliErrorMessage,
   parseCliOutput,
+  type CliContentBlockEvent,
   type CliOutput,
   type CliStreamingDelta,
 } from "../cli-output.js";
@@ -685,6 +686,7 @@ function createTurn(params: {
   context: PreparedCliRunContext;
   noOutputTimeoutMs: number;
   onAssistantDelta: (delta: CliStreamingDelta) => void;
+  onContentBlockEvent?: (event: CliContentBlockEvent) => void;
   session: ClaudeLiveSession;
   resolve: (output: CliOutput) => void;
   reject: (error: unknown) => void;
@@ -700,6 +702,7 @@ function createTurn(params: {
       backend: params.context.preparedBackend.backend,
       providerId: params.context.backendResolved.id,
       onAssistantDelta: params.onAssistantDelta,
+      onContentBlockEvent: params.onContentBlockEvent,
     }),
     resolve: params.resolve,
     reject: params.reject,
@@ -765,6 +768,7 @@ export async function runClaudeLiveSessionTurn(params: {
   noOutputTimeoutMs: number;
   getProcessSupervisor: () => ProcessSupervisor;
   onAssistantDelta: (delta: CliStreamingDelta) => void;
+  onContentBlockEvent?: (event: CliContentBlockEvent) => void;
   cleanup: () => Promise<void>;
 }): Promise<ClaudeLiveRunResult> {
   const key = buildClaudeLiveKey(params.context);
@@ -876,6 +880,7 @@ export async function runClaudeLiveSessionTurn(params: {
       context: params.context,
       noOutputTimeoutMs: params.noOutputTimeoutMs,
       onAssistantDelta: params.onAssistantDelta,
+      onContentBlockEvent: params.onContentBlockEvent,
       session: liveSession,
       resolve,
       reject,

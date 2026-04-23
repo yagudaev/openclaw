@@ -1,5 +1,5 @@
 import { shouldLogVerbose } from "../../globals.js";
-import { emitAgentEvent } from "../../infra/agent-events.js";
+import { emitAgentEvent, emitAgentItemEvent } from "../../infra/agent-events.js";
 import { isTruthyEnvValue } from "../../infra/env.js";
 import { requestHeartbeatNow as requestHeartbeatNowImpl } from "../../infra/heartbeat-wake.js";
 import { sanitizeHostExecEnv } from "../../infra/host-env-security.js";
@@ -337,6 +337,21 @@ export async function executePreparedCliRun(
             throw new Error("Claude live session requires JSONL streaming parser");
           }
           claudeSkillsPluginCleanupOwned = true;
+          // Emit the resolved CLI input (system prompt + final prompt) so
+          // observability subscribers can attach it to the in-flight generation
+          // span. This is the one layer at which the workspace bootstrap
+          // (MEMORY.md truncation, identity/soul) has been composed and the
+          // final text going to claude-cli is visible.
+          emitAgentEvent({
+            runId: params.runId,
+            stream: "cli_input",
+            data: {
+              systemPrompt: systemPromptArg ?? "",
+              prompt,
+              model: context.normalizedModel,
+            },
+          });
+          const toolUseTitleById = new Map<string, string>();
           const liveResult = await runClaudeLiveSessionTurn({
             context,
             args,
@@ -358,6 +373,40 @@ export async function executePreparedCliRun(
                     delta,
                     context.backendResolved.textTransforms?.output,
                   ),
+                },
+              });
+            },
+            onContentBlockEvent: (evt) => {
+              if (evt.phase === "start") {
+                toolUseTitleById.set(evt.itemId, evt.name);
+                emitAgentItemEvent({
+                  runId: params.runId,
+                  data: {
+                    itemId: evt.itemId,
+                    phase: "start",
+                    kind: evt.kind,
+                    title: evt.name,
+                    name: evt.name,
+                    toolCallId: evt.itemId,
+                    status: "running",
+                    startedAt: Date.now(),
+                  },
+                });
+                return;
+              }
+              const title = toolUseTitleById.get(evt.itemId) ?? "tool";
+              toolUseTitleById.delete(evt.itemId);
+              emitAgentItemEvent({
+                runId: params.runId,
+                data: {
+                  itemId: evt.itemId,
+                  phase: "end",
+                  kind: "tool",
+                  title,
+                  name: title,
+                  toolCallId: evt.itemId,
+                  status: "completed",
+                  endedAt: Date.now(),
                 },
               });
             },

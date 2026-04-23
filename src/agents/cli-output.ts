@@ -336,15 +336,27 @@ function parseClaudeCliStreamingDelta(params: {
   };
 }
 
+// Tool-use lifecycle events lifted out of the Claude stream for observability
+// (e.g. agent-event bus → OTel/Langfuse item spans). Text-deltas stay on the
+// existing `onAssistantDelta` callback.
+export type CliContentBlockEvent =
+  | { phase: "start"; itemId: string; name: string; kind: "tool" }
+  | { phase: "end"; itemId: string };
+
 export function createCliJsonlStreamingParser(params: {
   backend: CliBackendConfig;
   providerId: string;
   onAssistantDelta: (delta: CliStreamingDelta) => void;
+  onContentBlockEvent?: (event: CliContentBlockEvent) => void;
 }) {
   let lineBuffer = "";
   let assistantText = "";
   let sessionId: string | undefined;
   let usage: CliUsage | undefined;
+  // Claude's stream uses `index` to thread content_block_start → _stop events;
+  // we remember what each index's tool_use looked like so the stop event
+  // (which carries no payload) can emit a matching `phase: "end"` item event.
+  const toolUseByIndex = new Map<number, { itemId: string }>();
 
   const handleParsedRecord = (parsed: Record<string, unknown>) => {
     sessionId = pickCliSessionId(parsed, params.backend) ?? sessionId;
@@ -363,11 +375,14 @@ export function createCliJsonlStreamingParser(params: {
       sessionId,
       usage,
     });
-    if (!delta) {
-      return;
+    if (delta) {
+      assistantText = delta.text;
+      params.onAssistantDelta(delta);
     }
-    assistantText = delta.text;
-    params.onAssistantDelta(delta);
+
+    if (params.onContentBlockEvent) {
+      handleClaudeContentBlockEvent(parsed, toolUseByIndex, params.onContentBlockEvent);
+    }
   };
 
   const flushLines = (flushPartial: boolean) => {
@@ -506,4 +521,48 @@ export function extractCliErrorMessage(raw: string): string | null {
   }
 
   return errorText || null;
+}
+
+// Claude CLI jsonl wraps Anthropic messages stream events as
+// `{ type: "stream_event", event: { type: "content_block_start" | "content_block_stop", ... } }`.
+// We care about `content_block_start` with `content_block.type === "tool_use"`
+// (gives us the tool id + name) and the matching `content_block_stop` (gives us
+// an index we look up to emit a close).
+function handleClaudeContentBlockEvent(
+  parsed: Record<string, unknown>,
+  toolUseByIndex: Map<number, { itemId: string }>,
+  emit: (event: CliContentBlockEvent) => void,
+): void {
+  if (parsed.type !== "stream_event" || !isRecord(parsed.event)) {
+    return;
+  }
+  const event = parsed.event;
+  const index = typeof event.index === "number" ? event.index : null;
+
+  if (event.type === "content_block_start" && isRecord(event.content_block)) {
+    if (index === null) {
+      return;
+    }
+    const block = event.content_block;
+    if (block.type !== "tool_use") {
+      return;
+    }
+    const itemId = typeof block.id === "string" ? block.id : null;
+    const name = typeof block.name === "string" ? block.name : null;
+    if (!itemId || !name) {
+      return;
+    }
+    toolUseByIndex.set(index, { itemId });
+    emit({ phase: "start", itemId, name, kind: "tool" });
+    return;
+  }
+
+  if (event.type === "content_block_stop" && index !== null) {
+    const started = toolUseByIndex.get(index);
+    if (!started) {
+      return;
+    }
+    toolUseByIndex.delete(index);
+    emit({ phase: "end", itemId: started.itemId });
+  }
 }

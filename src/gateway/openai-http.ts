@@ -13,7 +13,7 @@ import { normalizeUsage, toOpenAiChatCompletionsUsage } from "../agents/usage.js
 import { createDefaultDeps } from "../cli/deps.js";
 import { agentCommandFromIngress } from "../commands/agent.js";
 import type { GatewayHttpChatCompletionsConfig } from "../config/types.gateway.js";
-import { emitAgentEvent, onAgentEvent } from "../infra/agent-events.js";
+import { emitAgentEvent, onAgentEvent, type AgentItemEventData } from "../infra/agent-events.js";
 import { logWarn } from "../logger.js";
 import { estimateBase64DecodedBytes } from "../media/base64.js";
 import {
@@ -593,6 +593,17 @@ async function processOpenAiHttpRequest(
     "openclaw.gateway.stream": stream,
   });
 
+  // Capture the HTTP request body as the span's input so Langfuse's Preview
+  // tab shows the incoming chat payload (messages array) rather than a null.
+  // The wrapping `openclaw.chat_completions` span represents the HTTP layer;
+  // the LLM-specific work lives in the nested `openclaw.llm` generation.
+  if (isTraceContentEnabled()) {
+    const messages = asMessages(payload.messages);
+    if (messages.length > 0) {
+      rootSpan.setAttribute("langfuse.observation.input", JSON.stringify(messages));
+    }
+  }
+
   const { agentId, sessionKey, messageChannel } = resolveGatewayRequestContext({
     req,
     model,
@@ -662,6 +673,8 @@ async function processOpenAiHttpRequest(
         model,
         runId,
         prompt: prompt.message,
+        extraSystemPrompt: prompt.extraSystemPrompt,
+        requestMessages: asMessages(payload.messages),
       });
 
       if (abortController.signal.aborted) {
@@ -670,6 +683,10 @@ async function processOpenAiHttpRequest(
 
       const content = resolveAgentResponseText(result);
       const usage = resolveChatCompletionUsage(result);
+
+      if (isTraceContentEnabled()) {
+        rootSpan.setAttribute("langfuse.observation.output", content);
+      }
 
       sendJson(res, 200, {
         id: runId,
@@ -791,6 +808,8 @@ async function processOpenAiHttpRequest(
         model,
         runId,
         prompt: prompt.message,
+        extraSystemPrompt: prompt.extraSystemPrompt,
+        requestMessages: asMessages(payload.messages),
       });
 
       if (closed) {
@@ -862,11 +881,20 @@ async function processOpenAiHttpRequest(
 
 // Wraps `agentCommandFromIngress` in a Langfuse GENERATION span. Emits model,
 // prompt, and completion attributes so the downstream trace captures the LLM
-// call inside the gateway — not just the HTTP envelope.
+// call inside the gateway — not just the HTTP envelope. Also subscribes to the
+// agent's item event stream so every tool call / command / search inside the
+// agent becomes its own child span under the generation — the caller sees the
+// exact work the agent did, not just the wrapper envelope.
 async function runAgentCommandWithGenerationSpan(
   commandInput: Parameters<typeof agentCommandFromIngress>[0],
   deps: Parameters<typeof agentCommandFromIngress>[2],
-  attrs: { model: string; runId: string; prompt: string | undefined },
+  attrs: {
+    model: string;
+    runId: string;
+    prompt: string | undefined;
+    extraSystemPrompt?: string;
+    requestMessages?: OpenAiChatMessage[];
+  },
 ): Promise<Awaited<ReturnType<typeof agentCommandFromIngress>>> {
   const traceContent = isTraceContentEnabled();
   const generation = openaiCompatTracer.startSpan("openclaw.llm", {
@@ -875,13 +903,51 @@ async function runAgentCommandWithGenerationSpan(
       "langfuse.observation.model.name": attrs.model,
       "gen_ai.request.model": attrs.model,
       "openclaw.run_id": attrs.runId,
-      ...(traceContent && attrs.prompt !== undefined
-        ? { "langfuse.observation.input": attrs.prompt }
-        : {}),
+      ...(traceContent ? buildGenerationInputAttributes(attrs) : {}),
     },
   });
+  const generationCtx = trace.setSpan(context.active(), generation);
+  const itemSpans = new Map<string, Span>();
+  const unsubscribe = onAgentEvent((evt) => {
+    if (evt.runId !== attrs.runId) {
+      return;
+    }
+    if (evt.stream === "item") {
+      handleItemEvent({
+        data: evt.data as unknown as AgentItemEventData,
+        itemSpans,
+        parentCtx: generationCtx,
+        traceContent,
+      });
+      return;
+    }
+    if (evt.stream === "cli_input" && traceContent) {
+      // Resolved system prompt + final prompt that claude-cli actually
+      // receives — captured at the cli-runner layer where the workspace
+      // bootstrap (MEMORY.md, identity) has been composed into the request.
+      // Promote this into `langfuse.observation.input` so it shows up in the
+      // Langfuse Preview panel as a proper chat conversation, not buried in
+      // metadata. The caller-side messages we captured at span-open are
+      // typically just the user turn (voiceclaw's ask_brain sends only that);
+      // the resolved CLI input is the interesting view.
+      const data = evt.data as unknown as {
+        systemPrompt?: string;
+        prompt?: string;
+      };
+      const messages: Array<{ role: string; content: string }> = [];
+      if (typeof data.systemPrompt === "string" && data.systemPrompt.length > 0) {
+        messages.push({ role: "system", content: data.systemPrompt });
+      }
+      if (typeof data.prompt === "string" && data.prompt.length > 0) {
+        messages.push({ role: "user", content: data.prompt });
+      }
+      if (messages.length > 0) {
+        generation.setAttribute("langfuse.observation.input", JSON.stringify(messages));
+      }
+    }
+  });
   try {
-    const result = await context.with(trace.setSpan(context.active(), generation), () =>
+    const result = await context.with(generationCtx, () =>
       agentCommandFromIngress(commandInput, defaultRuntime, deps),
     );
     const usage = resolveChatCompletionUsage(result);
@@ -899,6 +965,108 @@ async function runAgentCommandWithGenerationSpan(
     generation.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
     throw err;
   } finally {
+    unsubscribe();
+    // Close any item spans the agent forgot (or crashed before) closing. We
+    // see these as WARNING in Langfuse, distinct from clean completions, so
+    // missing `end` events are visible instead of hiding silently.
+    for (const [itemId, span] of itemSpans) {
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: "item span closed without end phase",
+      });
+      span.end();
+      itemSpans.delete(itemId);
+    }
     generation.end();
+  }
+}
+
+// Compose the `langfuse.observation.input` payload for the openclaw.llm span.
+// Langfuse recognises a chat-shaped JSON string (array of {role, content}) and
+// renders it as a conversation in the UI — making the system prompt and any
+// openclaw-appended `extraSystemPrompt` directly visible instead of only the
+// terminal user turn. Falls back to the plain user string when the caller
+// didn't thread richer context through.
+//
+// Captures what the OpenAI-compat caller SENT. Does not yet capture what
+// openclaw's cli-runner then injects (workspace MEMORY.md bootstrap, identity,
+// soul) — deeper hook in cli-runner is a follow-up.
+function buildGenerationInputAttributes(attrs: {
+  prompt: string | undefined;
+  extraSystemPrompt?: string;
+  requestMessages?: OpenAiChatMessage[];
+}): Record<string, string> {
+  const messages: Array<{ role: string; content: unknown }> = [];
+  if (attrs.extraSystemPrompt) {
+    messages.push({ role: "system", content: attrs.extraSystemPrompt });
+  }
+  if (attrs.requestMessages) {
+    for (const m of attrs.requestMessages) {
+      const role = typeof m.role === "string" ? m.role : "user";
+      messages.push({ role, content: m.content });
+    }
+  }
+  if (messages.length > 0) {
+    return { "langfuse.observation.input": JSON.stringify(messages) };
+  }
+  if (attrs.prompt !== undefined) {
+    return { "langfuse.observation.input": attrs.prompt };
+  }
+  return {};
+}
+
+// Langfuse observation type mapping for agent item kinds. `tool` / `command` /
+// `search` are shown as TOOL in Langfuse so they render with the tool icon;
+// `patch` / `analysis` / unknown kinds stay SPAN.
+const TOOL_KINDS = new Set(["tool", "command", "search"]);
+
+function resolveItemObservationType(kind: string): "TOOL" | "SPAN" {
+  return TOOL_KINDS.has(kind) ? "TOOL" : "SPAN";
+}
+
+function handleItemEvent(params: {
+  data: AgentItemEventData;
+  itemSpans: Map<string, Span>;
+  parentCtx: ReturnType<typeof trace.setSpan>;
+  traceContent: boolean;
+}): void {
+  const { data, itemSpans, parentCtx, traceContent } = params;
+  if (data.phase === "start") {
+    if (itemSpans.has(data.itemId)) {
+      return;
+    } // dedupe duplicate starts
+    const span = openaiCompatTracer.startSpan(
+      `openclaw.${data.kind}`,
+      {
+        attributes: {
+          "langfuse.observation.type": resolveItemObservationType(data.kind),
+          "openclaw.item.id": data.itemId,
+          "openclaw.item.kind": data.kind,
+          "openclaw.item.title": data.title,
+          ...(data.name ? { "openclaw.item.name": data.name } : {}),
+          ...(data.toolCallId ? { "openclaw.item.tool_call_id": data.toolCallId } : {}),
+        },
+      },
+      parentCtx,
+    );
+    itemSpans.set(data.itemId, span);
+    return;
+  }
+  if (data.phase === "end") {
+    const span = itemSpans.get(data.itemId);
+    if (!span) {
+      return;
+    }
+    if (data.status === "failed" || data.status === "blocked") {
+      span.setStatus({
+        code: SpanStatusCode.ERROR,
+        message: data.error ?? data.status,
+      });
+    }
+    if (traceContent && data.summary) {
+      span.setAttribute("langfuse.observation.output", data.summary);
+    }
+    span.end();
+    itemSpans.delete(data.itemId);
   }
 }
