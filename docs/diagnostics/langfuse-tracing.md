@@ -9,13 +9,15 @@ The tracer also extracts the W3C `traceparent` header from incoming requests. A 
 
 ## Enabling
 
-Set three environment variables before starting the gateway:
+Drop the keys in `~/.openclaw/.env` (same directory as `openclaw.json` — openclaw's normal runtime state dir):
 
 ```
 LANGFUSE_PUBLIC_KEY=pk-lf-...
 LANGFUSE_SECRET_KEY=sk-lf-...
 LANGFUSE_BASE_URL=https://us.cloud.langfuse.com
 ```
+
+The gateway auto-loads this file on startup. Existing `process.env` wins, so if you'd rather export keys in your shell or supervisor config, that also works.
 
 Missing keys soft-disable tracing. The gateway still runs, no spans are emitted, no network calls are made to Langfuse.
 

@@ -10,6 +10,9 @@
 // Call `initLangfuseTracing()` once, as early in gateway startup as possible.
 // Subsequent calls are no-ops.
 
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { logWarn } from "../logger.js";
@@ -17,10 +20,32 @@ import { logWarn } from "../logger.js";
 let sdk: NodeSDK | null = null;
 let enabled = false;
 
+// Match the rest of openclaw's "runtime state lives under ~/.openclaw/"
+// convention: look for `~/.openclaw/.env` and load it into process.env before
+// we read LANGFUSE_* keys. Existing environment wins, so OTEL_SERVICE_NAME or
+// similar set in the shell still override the file.
+function loadOpenClawDotenv(): void {
+  const path = join(homedir(), ".openclaw", ".env");
+  if (!existsSync(path)) {
+    return;
+  }
+  const loader = (process as unknown as { loadEnvFile?: (p: string) => void }).loadEnvFile;
+  if (typeof loader !== "function") {
+    return;
+  }
+  try {
+    loader.call(process, path);
+  } catch (err) {
+    logWarn(`langfuse tracing: failed to load ${path}: ${(err as Error).message}`);
+  }
+}
+
 export function initLangfuseTracing(): void {
   if (sdk) {
     return;
   }
+
+  loadOpenClawDotenv();
 
   const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
   const secretKey = process.env.LANGFUSE_SECRET_KEY;
