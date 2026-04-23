@@ -45,6 +45,7 @@ import {
   resolveOpenAiCompatModelOverride,
   resolveOpenAiCompatibleHttpOperatorScopes,
   resolveOpenAiCompatibleHttpSenderIsOwner,
+  type AuthorizedGatewayHttpRequest,
 } from "./http-utils.js";
 import { normalizeInputHostnameAllowlist } from "./input-allowlist.js";
 
@@ -506,43 +507,17 @@ function resolveIncludeUsageForStreaming(payload: OpenAiChatCompletionRequest): 
 
 const openaiCompatTracer = trace.getTracer("openclaw-gateway/openai-http");
 
+// Opt-in full-content export. Prompts + assistant outputs can contain PII or
+// secrets; gate content-bearing attributes behind an explicit flag rather than
+// sending everything to Langfuse by default.
+function isTraceContentEnabled(): boolean {
+  return process.env.LANGFUSE_TRACE_CONTENT === "1";
+}
+
 export async function handleOpenAiHttpRequest(
   req: IncomingMessage,
   res: ServerResponse,
   opts: OpenAiHttpOptions,
-): Promise<boolean> {
-  // Extract W3C trace context from the incoming request. When the caller is
-  // the voiceclaw relay the extracted context is the `ask_brain` tool span, so
-  // every span we create below nests under it — one unified trace per voice
-  // turn across both services.
-  const parentCtx = propagation.extract(context.active(), req.headers);
-  const rootSpan = openaiCompatTracer.startSpan(
-    "openclaw.chat_completions",
-    {
-      kind: SpanKind.SERVER,
-      attributes: {
-        "http.method": "POST",
-        "http.route": "/v1/chat/completions",
-        "langfuse.observation.type": "SPAN",
-      },
-    },
-    parentCtx,
-  );
-  const rootCtx = trace.setSpan(parentCtx, rootSpan);
-  // Close the span on socket close — covers the streaming path (which returns
-  // early while the SSE loop runs in the background), client disconnects, and
-  // the non-streaming finally path. OTel spans silently ignore double-end, so
-  // later explicit .end() calls are safe.
-  res.once("close", () => rootSpan.end());
-
-  return context.with(rootCtx, () => processOpenAiHttpRequest(req, res, opts, rootSpan));
-}
-
-async function processOpenAiHttpRequest(
-  req: IncomingMessage,
-  res: ServerResponse,
-  opts: OpenAiHttpOptions,
-  rootSpan: Span,
 ): Promise<boolean> {
   const limits = resolveOpenAiChatCompletionsLimits(opts.config);
   const handled = await handleGatewayPostJsonEndpoint(req, res, {
@@ -561,8 +536,48 @@ async function processOpenAiHttpRequest(
     return false;
   }
   if (!handled) {
+    // Auth/body failure — helper already sent the error response. Skip tracing
+    // to avoid attaching a no-op span to an incoming `traceparent` for a
+    // request that never reached our handler.
     return true;
   }
+
+  // Now we know this is a real chat_completions request for us — open the
+  // root span. Extract W3C trace context from the incoming request so callers
+  // that already trace (e.g. the voiceclaw relay's ask_brain tool span) see
+  // our spans as children.
+  const parentCtx = propagation.extract(context.active(), req.headers);
+  const rootSpan = openaiCompatTracer.startSpan(
+    "openclaw.chat_completions",
+    {
+      kind: SpanKind.SERVER,
+      attributes: {
+        "http.method": "POST",
+        "http.route": "/v1/chat/completions",
+        "langfuse.observation.type": "SPAN",
+      },
+    },
+    parentCtx,
+  );
+  const rootCtx = trace.setSpan(parentCtx, rootSpan);
+  // End on `finish` so span duration reflects request time even on keep-alive
+  // (where `close` fires only when the connection tears down). Also listen on
+  // `close` as a safety net for client aborts mid-stream. OTel silently
+  // tolerates double-end.
+  res.once("finish", () => rootSpan.end());
+  res.once("close", () => rootSpan.end());
+
+  return context.with(rootCtx, () => processOpenAiHttpRequest(req, res, opts, handled, rootSpan));
+}
+
+async function processOpenAiHttpRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  opts: OpenAiHttpOptions,
+  handled: { body: unknown; requestAuth: AuthorizedGatewayHttpRequest },
+  rootSpan: Span,
+): Promise<boolean> {
+  const limits = resolveOpenAiChatCompletionsLimits(opts.config);
   // On the compat surface, shared-secret bearer auth is also treated as an
   // owner sender so owner-only tool policy matches the documented contract.
   const senderIsOwner = resolveOpenAiCompatibleHttpSenderIsOwner(req, handled.requestAuth);
@@ -674,6 +689,7 @@ async function processOpenAiHttpRequest(
       if (abortController.signal.aborted) {
         return true;
       }
+      rootSpan.recordException(err as Error);
       rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
       logWarn(`openai-compat: chat completion failed: ${String(err)}`);
       sendJson(res, 500, {
@@ -781,9 +797,11 @@ async function processOpenAiHttpRequest(
         return;
       }
 
-      rootSpan.setAttributes({
-        "langfuse.observation.output": resolveAgentResponseText(result),
-      });
+      if (isTraceContentEnabled()) {
+        rootSpan.setAttributes({
+          "langfuse.observation.output": resolveAgentResponseText(result),
+        });
+      }
       finalUsage = resolveChatCompletionUsage(result);
 
       if (!sawAssistantDelta) {
@@ -807,6 +825,7 @@ async function processOpenAiHttpRequest(
       if (closed || abortController.signal.aborted) {
         return;
       }
+      rootSpan.recordException(err as Error);
       rootSpan.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
       logWarn(`openai-compat: streaming chat completion failed: ${String(err)}`);
       writeAssistantContentChunk(res, {
@@ -849,23 +868,25 @@ async function runAgentCommandWithGenerationSpan(
   deps: Parameters<typeof agentCommandFromIngress>[2],
   attrs: { model: string; runId: string; prompt: string | undefined },
 ): Promise<Awaited<ReturnType<typeof agentCommandFromIngress>>> {
+  const traceContent = isTraceContentEnabled();
   const generation = openaiCompatTracer.startSpan("openclaw.llm", {
     attributes: {
       "langfuse.observation.type": "GENERATION",
       "langfuse.observation.model.name": attrs.model,
       "gen_ai.request.model": attrs.model,
       "openclaw.run_id": attrs.runId,
-      ...(attrs.prompt !== undefined ? { "langfuse.observation.input": attrs.prompt } : {}),
+      ...(traceContent && attrs.prompt !== undefined
+        ? { "langfuse.observation.input": attrs.prompt }
+        : {}),
     },
   });
   try {
     const result = await context.with(trace.setSpan(context.active(), generation), () =>
       agentCommandFromIngress(commandInput, defaultRuntime, deps),
     );
-    const output = resolveAgentResponseText(result);
     const usage = resolveChatCompletionUsage(result);
     generation.setAttributes({
-      "langfuse.observation.output": output,
+      ...(traceContent ? { "langfuse.observation.output": resolveAgentResponseText(result) } : {}),
       "langfuse.observation.usage_details": JSON.stringify({
         input: usage.prompt_tokens,
         output: usage.completion_tokens,

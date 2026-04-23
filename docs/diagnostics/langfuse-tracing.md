@@ -21,6 +21,8 @@ Missing keys soft-disable tracing. The gateway still runs, no spans are emitted,
 
 Optional: `OTEL_SERVICE_NAME=openclaw-gateway` (the default). Override when running multiple gateways against the same Langfuse project so you can filter by service in the Langfuse UI.
 
+Optional: `LANGFUSE_TRACE_CONTENT=1`. Off by default. Prompts and assistant outputs can contain PII or secrets, so content-bearing attributes (`langfuse.observation.input` / `langfuse.observation.output`) are suppressed unless you explicitly opt in. Usage-details (tokens), model name, `http.*` attributes, and trace structure always export.
+
 ## What you'll see
 
 Every `/v1/chat/completions` request emits two observations:
