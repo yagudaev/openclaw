@@ -41,6 +41,7 @@ import {
   getInspectableTaskRegistrySummary,
   stopTaskRegistryMaintenance,
 } from "../tasks/task-registry.maintenance.js";
+import { initLangfuseTracing } from "../tracing/langfuse.js";
 import { runSetupWizard } from "../wizard/setup.js";
 import { createAuthRateLimiter, type AuthRateLimiter } from "./auth-rate-limit.js";
 import { resolveGatewayAuth } from "./auth.js";
@@ -245,6 +246,14 @@ export async function startGatewayServer(
 ): Promise<GatewayServer> {
   const minimalTestGateway =
     isVitestRuntimeEnv() && process.env.OPENCLAW_TEST_MINIMAL_GATEWAY === "1";
+
+  // Boot OTel/Langfuse before any request path can fire, so spans created
+  // inside request handlers (openai-compat HTTP, etc.) have a live SDK
+  // backing them. Soft-disabled when LANGFUSE_* envs are missing so this is
+  // safe to run unconditionally in dev and prod.
+  if (!minimalTestGateway) {
+    initLangfuseTracing();
+  }
 
   // Ensure all default port derivations (browser/canvas) see the actual runtime port.
   process.env.OPENCLAW_GATEWAY_PORT = String(port);

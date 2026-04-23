@@ -1607,7 +1607,8 @@
                   "help/testing",
                   "help/scripts",
                   "debug/node-issue",
-                  "diagnostics/flags"
+                  "diagnostics/flags",
+                  "diagnostics/langfuse-tracing"
                 ]
               },
               {
