@@ -687,6 +687,9 @@ async function processOpenAiHttpRequest(
       if (isTraceContentEnabled()) {
         rootSpan.setAttribute("langfuse.observation.output", content);
       }
+      // End root span deterministically on success so the output attribute is
+      // serialized with the final value. See streaming-path note for rationale.
+      rootSpan.end();
 
       sendJson(res, 200, {
         id: runId,
@@ -821,6 +824,11 @@ async function processOpenAiHttpRequest(
           "langfuse.observation.output": resolveAgentResponseText(result),
         });
       }
+      // End the root span deterministically on success so the output attribute
+      // we just set is guaranteed to be serialized. The res `finish`/`close`
+      // listeners remain as safety nets for aborted / error paths, but racing
+      // them here produced empty output on openclaw.chat_completions.
+      rootSpan.end();
       finalUsage = resolveChatCompletionUsage(result);
 
       if (!sawAssistantDelta) {
