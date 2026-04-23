@@ -1,5 +1,5 @@
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagingToolSend } from "./pi-embedded-messaging.types.js";
 import {
   handleToolExecutionEnd,
@@ -957,5 +957,70 @@ describe("messaging tool media URL tracking", () => {
 
     expect(ctx.state.messagingToolSentMediaUrls).toHaveLength(0);
     expect(ctx.state.pendingMessagingMediaUrls.has("tool-m3")).toBe(false);
+  });
+});
+
+describe("LANGFUSE_TRACE_CONTENT gate on item events", () => {
+  const originalEnv = process.env.LANGFUSE_TRACE_CONTENT;
+
+  afterEach(() => {
+    if (originalEnv === undefined) {
+      delete process.env.LANGFUSE_TRACE_CONTENT;
+    } else {
+      process.env.LANGFUSE_TRACE_CONTENT = originalEnv;
+    }
+  });
+
+  it("strips input/output from emitted item events when LANGFUSE_TRACE_CONTENT != '1'", async () => {
+    delete process.env.LANGFUSE_TRACE_CONTENT;
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(ctx, {
+      type: "tool_execution_start",
+      toolName: "mcp__openclaw__browser",
+      toolCallId: "tool-gated-1",
+      args: { secret: "do-not-leak" },
+    });
+
+    const itemEvents = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .filter((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return !!evt && typeof evt === "object" && (evt as { stream?: unknown }).stream === "item";
+      });
+    expect(itemEvents.length).toBeGreaterThan(0);
+    for (const evt of itemEvents) {
+      expect(evt.data.input).toBeUndefined();
+      expect(evt.data.output).toBeUndefined();
+      // Structural metadata must still flow.
+      expect(typeof evt.data.itemId).toBe("string");
+      expect(evt.data.name).toBe("mcp__openclaw__browser");
+      expect(evt.data.toolCallId).toBe("tool-gated-1");
+    }
+  });
+
+  it("passes input/output through when LANGFUSE_TRACE_CONTENT='1'", async () => {
+    process.env.LANGFUSE_TRACE_CONTENT = "1";
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(ctx, {
+      type: "tool_execution_start",
+      toolName: "mcp__openclaw__browser",
+      toolCallId: "tool-open-1",
+      args: { url: "https://example.com" },
+    });
+
+    const toolItemStart = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .find((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return (
+          !!evt &&
+          typeof evt === "object" &&
+          (evt as { stream?: unknown }).stream === "item" &&
+          (evt as { data?: { phase?: unknown; kind?: unknown } }).data?.kind === "tool" &&
+          (evt as { data?: { phase?: unknown; kind?: unknown } }).data?.phase === "start"
+        );
+      });
+    expect(toolItemStart).toBeDefined();
+    expect(toolItemStart!.data.input).toEqual({ url: "https://example.com" });
   });
 });

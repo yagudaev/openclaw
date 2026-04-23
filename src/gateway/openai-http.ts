@@ -48,6 +48,7 @@ import {
   type AuthorizedGatewayHttpRequest,
 } from "./http-utils.js";
 import { normalizeInputHostnameAllowlist } from "./input-allowlist.js";
+import { buildToolPayloadAttribute } from "./openai-http.tool-payload.js";
 
 type OpenAiHttpOptions = {
   auth: ResolvedGatewayAuth;
@@ -1120,44 +1121,18 @@ function handleItemEvent(params: {
   }
 }
 
-// Max serialized size for `gen_ai.tool.input` / `gen_ai.tool.output` payloads.
-// Large tool results (e.g. full browser snapshots) blow past OTLP limits and
-// make span exports reject. 64 KiB is a reasonable ceiling that still captures
-// per-call distinctiveness; when we truncate we set
-// `gen_ai.tool.<slot>.truncated` so consumers know.
-const TOOL_PAYLOAD_MAX_BYTES = 64 * 1024;
-
+// Apply a serialized + byte-truncated tool payload to the span as the
+// matching `gen_ai.tool.<slot>` attribute, plus a `.truncated=true` flag when
+// truncation occurred. Serialization, byte-safe truncation, and raw-size
+// guarding live in `openai-http.tool-payload.ts` so they can be unit tested
+// without a gateway server.
 function applyToolPayloadAttributes(span: Span, slot: "input" | "output", payload: unknown): void {
-  const serialized = serializeToolPayload(payload);
-  if (serialized === undefined) {
+  const attrs = buildToolPayloadAttribute(payload);
+  if (!attrs) {
     return;
   }
-  const truncated = serialized.length > TOOL_PAYLOAD_MAX_BYTES;
-  const value = truncated ? serialized.slice(0, TOOL_PAYLOAD_MAX_BYTES) : serialized;
-  span.setAttribute(`gen_ai.tool.${slot}`, value);
-  if (truncated) {
+  span.setAttribute(`gen_ai.tool.${slot}`, attrs.value);
+  if (attrs.truncated) {
     span.setAttribute(`gen_ai.tool.${slot}.truncated`, true);
-  }
-}
-
-// Best-effort serialization. Strings pass through so tool args/results that
-// are already text (e.g. stdout) do not get double-stringified. Objects are
-// JSON-encoded; circular/unserialisable payloads return a fixed sentinel
-// rather than risking `[object Object]` noise. We never throw — tracing must
-// not break the request path.
-function serializeToolPayload(payload: unknown): string | undefined {
-  if (payload === undefined || payload === null) {
-    return undefined;
-  }
-  if (typeof payload === "string") {
-    return payload;
-  }
-  if (typeof payload === "number" || typeof payload === "boolean") {
-    return String(payload);
-  }
-  try {
-    return JSON.stringify(payload);
-  } catch {
-    return "[unserializable]";
   }
 }
