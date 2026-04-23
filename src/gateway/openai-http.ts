@@ -1057,10 +1057,17 @@ function handleItemEvent(params: {
     if (itemSpans.has(data.itemId)) {
       return;
     } // dedupe duplicate starts
+    const isTool = resolveItemObservationType(data.kind) === "TOOL";
     const span = openaiCompatTracer.startSpan(
       `openclaw.${data.kind}`,
       {
         attributes: {
+          // OTel GenAI semantic conventions — also makes the span eligible for
+          // LangfuseSpanProcessor's default `shouldExportSpan` filter (which
+          // only exports spans carrying `gen_ai.*` attrs or coming from the
+          // Langfuse tracer scope).
+          "gen_ai.operation.name": isTool ? "execute_tool" : "workflow",
+          ...(isTool && data.name ? { "gen_ai.tool.name": data.name } : {}),
           "langfuse.observation.type": resolveItemObservationType(data.kind),
           "openclaw.item.id": data.itemId,
           "openclaw.item.kind": data.kind,
