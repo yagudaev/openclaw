@@ -105,6 +105,14 @@ export function truncateUtf8(str: string, maxBytes: number): ToolPayloadAttribut
 // enormous string / deeply nested payload) without materializing the full
 // result first.
 function stringifyWithSizeGuard(payload: unknown): string {
+  // Shallow walk for Buffer/TypedArray children. `JSON.stringify` invokes
+  // `toJSON()` on these values BEFORE the replacer sees the result, so a
+  // nested `{ data: hugeBuffer }` would already have allocated a
+  // multi-MiB integer array by the time the replacer runs. Catch that
+  // case with a one-level-deep scan before entering `JSON.stringify`.
+  if (containsHugeBinaryChild(payload)) {
+    return buildTruncatedPlaceholder();
+  }
   let running = 0;
   try {
     const encoded = JSON.stringify(payload, (key, value) => {
@@ -136,6 +144,34 @@ function stringifyWithSizeGuard(payload: unknown): string {
     }
     return "[unserializable]";
   }
+}
+
+function containsHugeBinaryChild(payload: unknown): boolean {
+  if (!payload || typeof payload !== "object") {
+    return false;
+  }
+  // We already handled the top-level case upstream; this only fires when
+  // a Buffer/TypedArray is nested inside a container. Walk own enumerable
+  // properties / array elements exactly one level deep — deeper nesting
+  // would require arbitrary traversal which is out of budget for a
+  // tracing hot path. In practice tool results almost always nest binary
+  // payloads at the first level (`{ data: Buffer }` / `{ bytes: Uint8Array }`).
+  if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      const size = estimateDirectByteSize(entry);
+      if (size !== undefined && size > TOOL_PAYLOAD_RAW_MAX_BYTES) {
+        return true;
+      }
+    }
+    return false;
+  }
+  for (const key of Object.keys(payload as Record<string, unknown>)) {
+    const size = estimateDirectByteSize((payload as Record<string, unknown>)[key]);
+    if (size !== undefined && size > TOOL_PAYLOAD_RAW_MAX_BYTES) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function buildTruncatedPlaceholder(): string {

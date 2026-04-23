@@ -118,6 +118,26 @@ describe("serializeToolPayload", () => {
     expect(out).toMatch(/^\[truncated:/);
   });
 
+  test("size-guards huge Buffer nested inside an object", () => {
+    // `JSON.stringify` calls Buffer.toJSON() before any replacer sees the
+    // result, so a nested Buffer in `{ data: hugeBuffer }` would otherwise
+    // allocate a multi-MiB integer array first. The shallow-walk guard
+    // must catch this.
+    const payload = { name: "snapshot", data: Buffer.alloc(2 * 1024 * 1024) };
+    const out = serializeToolPayload(payload);
+    expect(out).toBeDefined();
+    expect(out!.length).toBeLessThan(200);
+    expect(out).toMatch(/^\[truncated:/);
+  });
+
+  test("size-guards huge typed-array nested inside an array", () => {
+    const payload = ["head", new Uint8Array(2 * 1024 * 1024), "tail"];
+    const out = serializeToolPayload(payload);
+    expect(out).toBeDefined();
+    expect(out!.length).toBeLessThan(200);
+    expect(out).toMatch(/^\[truncated:/);
+  });
+
   test("size-guards payloads with huge object keys", () => {
     // Key strings can also be arbitrarily large. A 2 MiB key must trip the
     // guard even though the value is tiny — otherwise a malicious caller

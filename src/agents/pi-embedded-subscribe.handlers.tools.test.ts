@@ -1023,4 +1023,86 @@ describe("LANGFUSE_TRACE_CONTENT gate on item events", () => {
     expect(toolItemStart).toBeDefined();
     expect(toolItemStart!.data.input).toEqual({ url: "https://example.com" });
   });
+
+  it("strips output from end-phase item events when gate is off", async () => {
+    delete process.env.LANGFUSE_TRACE_CONTENT;
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "read",
+        toolCallId: "tool-end-1",
+        args: { path: "/tmp/example.txt" },
+      } as never,
+    );
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "read",
+        toolCallId: "tool-end-1",
+        isError: false,
+        result: { content: [{ type: "text", text: "super-secret file contents" }] },
+      } as never,
+    );
+
+    const endEvents = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .filter((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return (
+          !!evt &&
+          typeof evt === "object" &&
+          (evt as { stream?: unknown }).stream === "item" &&
+          (evt as { data?: { phase?: unknown } }).data?.phase === "end"
+        );
+      });
+    expect(endEvents.length).toBeGreaterThan(0);
+    for (const evt of endEvents) {
+      expect(evt.data.output).toBeUndefined();
+      expect(evt.data.input).toBeUndefined();
+    }
+  });
+
+  it("passes output on end-phase item events when gate is on", async () => {
+    process.env.LANGFUSE_TRACE_CONTENT = "1";
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "read",
+        toolCallId: "tool-end-2",
+        args: { path: "/tmp/example.txt" },
+      } as never,
+    );
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "read",
+        toolCallId: "tool-end-2",
+        isError: false,
+        result: { content: [{ type: "text", text: "hello" }] },
+      } as never,
+    );
+
+    const endToolEvent = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .find((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return (
+          !!evt &&
+          typeof evt === "object" &&
+          (evt as { stream?: unknown }).stream === "item" &&
+          (evt as { data?: { kind?: unknown; phase?: unknown } }).data?.kind === "tool" &&
+          (evt as { data?: { kind?: unknown; phase?: unknown } }).data?.phase === "end"
+        );
+      });
+    expect(endToolEvent).toBeDefined();
+    expect(endToolEvent!.data.output).toBeDefined();
+  });
 });
