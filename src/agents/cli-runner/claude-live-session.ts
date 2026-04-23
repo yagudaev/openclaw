@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
+import { appendFileSync } from "node:fs";
 import type { ReplyBackendHandle } from "../../auto-reply/reply/reply-run-registry.js";
 import type { CliBackendConfig } from "../../config/types.js";
 import {
   createCliJsonlStreamingParser,
   extractCliErrorMessage,
   parseCliOutput,
+  type CliContentBlockEvent,
   type CliOutput,
   type CliStreamingDelta,
 } from "../cli-output.js";
@@ -458,6 +460,18 @@ function handleClaudeLiveLine(session: ClaudeLiveSession, line: string): void {
   if (!parsed) {
     return;
   }
+  // Debug: dump every parsed line to a file when OPENCLAW_CLAUDE_LIVE_RAW_DUMP
+  // is set. Useful for inspecting the actual claude-cli jsonl event shape
+  // (different from pi-embedded — OPENCLAW_RAW_STREAM doesn't cover this
+  // code path).
+  const dumpPath = process.env.OPENCLAW_CLAUDE_LIVE_RAW_DUMP;
+  if (dumpPath) {
+    try {
+      appendFileSync(dumpPath, `${trimmed}\n`);
+    } catch {
+      // Ignore dump failures — this is a debug facility, not a dependency.
+    }
+  }
   if (session.drainingAbortedTurn) {
     if (parsed.type === "result") {
       const turnToClear = session.currentTurn;
@@ -685,6 +699,7 @@ function createTurn(params: {
   context: PreparedCliRunContext;
   noOutputTimeoutMs: number;
   onAssistantDelta: (delta: CliStreamingDelta) => void;
+  onContentBlockEvent?: (event: CliContentBlockEvent) => void;
   session: ClaudeLiveSession;
   resolve: (output: CliOutput) => void;
   reject: (error: unknown) => void;
@@ -700,6 +715,7 @@ function createTurn(params: {
       backend: params.context.preparedBackend.backend,
       providerId: params.context.backendResolved.id,
       onAssistantDelta: params.onAssistantDelta,
+      onContentBlockEvent: params.onContentBlockEvent,
     }),
     resolve: params.resolve,
     reject: params.reject,
@@ -765,6 +781,7 @@ export async function runClaudeLiveSessionTurn(params: {
   noOutputTimeoutMs: number;
   getProcessSupervisor: () => ProcessSupervisor;
   onAssistantDelta: (delta: CliStreamingDelta) => void;
+  onContentBlockEvent?: (event: CliContentBlockEvent) => void;
   cleanup: () => Promise<void>;
 }): Promise<ClaudeLiveRunResult> {
   const key = buildClaudeLiveKey(params.context);
@@ -876,6 +893,7 @@ export async function runClaudeLiveSessionTurn(params: {
       context: params.context,
       noOutputTimeoutMs: params.noOutputTimeoutMs,
       onAssistantDelta: params.onAssistantDelta,
+      onContentBlockEvent: params.onContentBlockEvent,
       session: liveSession,
       resolve,
       reject,
