@@ -929,28 +929,42 @@ async function runAgentCommandWithGenerationSpan(
       });
       return;
     }
-    if (evt.stream === "cli_input" && traceContent) {
-      // Resolved system prompt + final prompt that claude-cli actually
-      // receives — captured at the cli-runner layer where the workspace
-      // bootstrap (MEMORY.md, identity) has been composed into the request.
-      // Promote this into `langfuse.observation.input` so it shows up in the
-      // Langfuse Preview panel as a proper chat conversation, not buried in
-      // metadata. The caller-side messages we captured at span-open are
-      // typically just the user turn (voiceclaw's ask_brain sends only that);
-      // the resolved CLI input is the interesting view.
+    if (evt.stream === "cli_input") {
       const data = evt.data as unknown as {
         systemPrompt?: string;
         prompt?: string;
+        model?: string;
       };
-      const messages: Array<{ role: string; content: string }> = [];
-      if (typeof data.systemPrompt === "string" && data.systemPrompt.length > 0) {
-        messages.push({ role: "system", content: data.systemPrompt });
+      // Promote the resolved model name onto the generation span. Until now
+      // we set it from the HTTP request's `model` field ("openclaw"), which
+      // hides the actual backend (e.g. claude-haiku-4-5, gpt-5.4) the brain
+      // dispatched to. Always set this — it's metadata about which model
+      // ran, not PII.
+      if (typeof data.model === "string" && data.model.length > 0) {
+        generation.setAttributes({
+          "langfuse.observation.model.name": data.model,
+          "gen_ai.request.model": data.model,
+        });
       }
-      if (typeof data.prompt === "string" && data.prompt.length > 0) {
-        messages.push({ role: "user", content: data.prompt });
-      }
-      if (messages.length > 0) {
-        generation.setAttribute("langfuse.observation.input", JSON.stringify(messages));
+      if (traceContent) {
+        // Resolved system prompt + final prompt that claude-cli actually
+        // receives — captured at the cli-runner layer where the workspace
+        // bootstrap (MEMORY.md, identity) has been composed into the
+        // request. Promote into `langfuse.observation.input` so it renders
+        // as a proper chat conversation in the Preview panel, not buried in
+        // metadata. The caller-side messages we captured at span-open are
+        // typically just the user turn (voiceclaw's ask_brain sends only
+        // that); the resolved CLI input is the interesting view.
+        const messages: Array<{ role: string; content: string }> = [];
+        if (typeof data.systemPrompt === "string" && data.systemPrompt.length > 0) {
+          messages.push({ role: "system", content: data.systemPrompt });
+        }
+        if (typeof data.prompt === "string" && data.prompt.length > 0) {
+          messages.push({ role: "user", content: data.prompt });
+        }
+        if (messages.length > 0) {
+          generation.setAttribute("langfuse.observation.input", JSON.stringify(messages));
+        }
       }
     }
   });

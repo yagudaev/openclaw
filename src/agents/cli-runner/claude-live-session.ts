@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { appendFileSync } from "node:fs";
 import type { ReplyBackendHandle } from "../../auto-reply/reply/reply-run-registry.js";
 import type { CliBackendConfig } from "../../config/types.js";
 import {
@@ -458,6 +459,18 @@ function handleClaudeLiveLine(session: ClaudeLiveSession, line: string): void {
   const parsed = parseClaudeLiveJsonLine(session, trimmed);
   if (!parsed) {
     return;
+  }
+  // Debug: dump every parsed line to a file when OPENCLAW_CLAUDE_LIVE_RAW_DUMP
+  // is set. Useful for inspecting the actual claude-cli jsonl event shape
+  // (different from pi-embedded — OPENCLAW_RAW_STREAM doesn't cover this
+  // code path).
+  const dumpPath = process.env.OPENCLAW_CLAUDE_LIVE_RAW_DUMP;
+  if (dumpPath) {
+    try {
+      appendFileSync(dumpPath, `${trimmed}\n`);
+    } catch {
+      // Ignore dump failures — this is a debug facility, not a dependency.
+    }
   }
   if (session.drainingAbortedTurn) {
     if (parsed.type === "result") {
