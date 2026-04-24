@@ -41,7 +41,8 @@ export function buildToolPayloadAttribute(payload: unknown): ToolPayloadAttribut
   if (serialized === undefined) {
     return undefined;
   }
-  return truncateUtf8(serialized, TOOL_PAYLOAD_MAX_BYTES);
+  const attrs = truncateUtf8(serialized, TOOL_PAYLOAD_MAX_BYTES);
+  return isRawPayloadTruncatedPlaceholder(serialized) ? { ...attrs, truncated: true } : attrs;
 }
 
 // Best-effort serialization. Strings pass through so tool args/results that
@@ -177,6 +178,10 @@ function containsHugeBinaryChild(payload: unknown): boolean {
 
 function buildTruncatedPlaceholder(): string {
   return `[truncated: raw payload exceeds ${TOOL_PAYLOAD_RAW_MAX_BYTES} bytes]`;
+}
+
+function isRawPayloadTruncatedPlaceholder(value: string): boolean {
+  return value === buildTruncatedPlaceholder();
 }
 
 // Best-effort byte-size estimate for payloads whose serialized JSON form
