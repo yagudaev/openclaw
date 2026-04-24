@@ -181,7 +181,7 @@ describe("buildToolPayloadAttribute", () => {
     const huge = "h".repeat(TOOL_PAYLOAD_RAW_MAX_BYTES * 2);
     const res = buildToolPayloadAttribute(huge);
     expect(res).toBeDefined();
-    expect(res!.truncated).toBe(false);
+    expect(res!.truncated).toBe(true);
     expect(res!.value).toMatch(/^\[truncated:/);
   });
 
