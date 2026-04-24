@@ -35,6 +35,7 @@ type VoiceClawRealtimeSessionOptions = {
   allowRealIpFallback: boolean;
   rateLimiter?: AuthRateLimiter;
   releasePreauthBudget: () => void;
+  adapterFactory?: () => VoiceClawRealtimeAdapter;
 };
 
 export class VoiceClawRealtimeSession {
@@ -48,6 +49,7 @@ export class VoiceClawRealtimeSession {
   private readonly allowRealIpFallback: boolean;
   private readonly rateLimiter: AuthRateLimiter | undefined;
   private readonly releasePreauthBudget: () => void;
+  private readonly adapterFactory: () => VoiceClawRealtimeAdapter;
   private adapter: VoiceClawRealtimeAdapter | null = null;
   private toolRuntime: VoiceClawRealtimeToolRuntime | null = null;
   private config: VoiceClawSessionConfigEvent | null = null;
@@ -64,6 +66,7 @@ export class VoiceClawRealtimeSession {
     this.allowRealIpFallback = opts.allowRealIpFallback;
     this.rateLimiter = opts.rateLimiter;
     this.releasePreauthBudget = once(opts.releasePreauthBudget);
+    this.adapterFactory = opts.adapterFactory ?? (() => new VoiceClawGeminiLiveAdapter());
   }
 
   attach(): void {
@@ -182,7 +185,7 @@ export class VoiceClawRealtimeSession {
       voice: config.voice || "Zephyr",
       brainAgent: config.brainAgent ?? "enabled",
     };
-    this.adapter = new VoiceClawGeminiLiveAdapter();
+    this.adapter = this.adapterFactory();
 
     try {
       if (!process.env.GEMINI_API_KEY?.trim()) {
@@ -226,6 +229,9 @@ export class VoiceClawRealtimeSession {
       }
     }
     this.send(event);
+    if (event.type === "error") {
+      this.closeWithSummary(1011, "upstream error");
+    }
   }
 
   private handleToolCall(event: VoiceClawToolCallEvent): void {
@@ -266,7 +272,18 @@ export class VoiceClawRealtimeSession {
     this.handshakeTimer = clearTimer(this.handshakeTimer);
   }
 
+  private closeWithSummary(code: number, reason: string): void {
+    this.endSession();
+    if (this.ws.readyState === WebSocket.OPEN) {
+      this.ws.close(code, reason);
+    }
+  }
+
   private async cleanup(): Promise<void> {
+    this.endSession();
+  }
+
+  private endSession(): void {
     if (this.closed) {
       return;
     }
@@ -277,7 +294,7 @@ export class VoiceClawRealtimeSession {
     const transcript = this.adapter?.getTranscript() ?? [];
     this.adapter?.disconnect();
     this.adapter = null;
-    if (transcript.length > 0 && this.ws.readyState === WebSocket.OPEN) {
+    if (this.config && this.ws.readyState === WebSocket.OPEN) {
       this.send({
         type: "session.ended",
         summary: "Real-time brain session ended.",
