@@ -1,5 +1,8 @@
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
-import { buildToolPayloadAttribute } from "../gateway/openai-http.tool-payload.js";
+import {
+  buildToolPayloadAttribute,
+  TOOL_PAYLOAD_RAW_MAX_BYTES,
+} from "../gateway/openai-http.tool-payload.js";
 import type {
   AgentApprovalEventData,
   AgentCommandOutputEventData,
@@ -183,11 +186,16 @@ export function buildToolStreamData(
   if (!attrs) {
     return data;
   }
-  data[content.field] = attrs.value;
-  if (attrs.truncated) {
+  const rawSizeGuarded = attrs.value === buildRawSizeGuardPlaceholder();
+  data[content.field] = attrs.truncated || rawSizeGuarded ? attrs.value : content.value;
+  if (attrs.truncated || rawSizeGuarded) {
     data[`${content.field}Truncated`] = true;
   }
   return data;
+}
+
+function buildRawSizeGuardPlaceholder(): string {
+  return `[truncated: raw payload exceeds ${TOOL_PAYLOAD_RAW_MAX_BYTES} bytes]`;
 }
 
 function readToolResultDetailsRecord(result: unknown): Record<string, unknown> | undefined {

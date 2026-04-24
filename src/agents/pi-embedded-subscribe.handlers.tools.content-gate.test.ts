@@ -34,17 +34,20 @@ describe("buildToolStreamData", () => {
     { field: "args" as const, value: { path: "secret.txt" } },
     { field: "partialResult" as const, value: { content: [{ text: "partial secret" }] } },
     { field: "result" as const, value: { content: [{ text: "result secret" }] } },
-  ])("keeps bounded $field content when capture is enabled", ({ field, value }) => {
-    process.env.OTEL_GENAI_CAPTURE_CONTENT = "1";
+  ])(
+    "keeps bounded $field content in its original shape when capture is enabled",
+    ({ field, value }) => {
+      process.env.OTEL_GENAI_CAPTURE_CONTENT = "1";
 
-    const data = buildToolStreamData(
-      { phase: "start", name: "read", toolCallId: "call-1" },
-      { field, value },
-    );
+      const data = buildToolStreamData(
+        { phase: "start", name: "read", toolCallId: "call-1" },
+        { field, value },
+      );
 
-    expect(data[field]).toBe(JSON.stringify(value));
-    expect(data[`${field}Truncated`]).toBeUndefined();
-  });
+      expect(data[field]).toEqual(value);
+      expect(data[`${field}Truncated`]).toBeUndefined();
+    },
+  );
 
   test("truncates enabled stream content at the shared UTF-8 byte limit", () => {
     process.env.OTEL_GENAI_CAPTURE_CONTENT = "1";
@@ -69,7 +72,7 @@ describe("buildToolStreamData", () => {
     );
 
     expect(data.args).toBe(`[truncated: raw payload exceeds ${TOOL_PAYLOAD_RAW_MAX_BYTES} bytes]`);
-    expect(data.argsTruncated).toBeUndefined();
+    expect(data.argsTruncated).toBe(true);
   });
 });
 
