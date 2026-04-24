@@ -31,6 +31,7 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "../shared/string-coerce.js";
+import { isContentCaptureEnabled } from "../tracing/content-gate.js";
 import { resolveAssistantStreamDeltaText } from "./agent-event-assistant-text.js";
 import {
   buildAgentMessageFromConversationEntries,
@@ -508,12 +509,10 @@ function resolveIncludeUsageForStreaming(payload: OpenAiChatCompletionRequest): 
 
 const openaiCompatTracer = trace.getTracer("openclaw-gateway/openai-http");
 
-// Opt-in full-content export. Prompts + assistant outputs can contain PII or
-// secrets; gate content-bearing attributes behind an explicit flag rather than
-// sending everything to Langfuse by default.
-function isTraceContentEnabled(): boolean {
-  return process.env.LANGFUSE_TRACE_CONTENT === "1";
-}
+// Content capture gate (OTEL_GENAI_CAPTURE_CONTENT, fallback:
+// LANGFUSE_TRACE_CONTENT). Prompts + assistant outputs can contain PII or
+// secrets; content-bearing attributes are suppressed unless explicitly
+// opted in. See `../tracing/content-gate.ts`.
 
 export async function handleOpenAiHttpRequest(
   req: IncomingMessage,
@@ -598,7 +597,7 @@ async function processOpenAiHttpRequest(
   // tab shows the incoming chat payload (messages array) rather than a null.
   // The wrapping `openclaw.chat_completions` span represents the HTTP layer;
   // the LLM-specific work lives in the nested `openclaw.llm` generation.
-  if (isTraceContentEnabled()) {
+  if (isContentCaptureEnabled()) {
     const messages = asMessages(payload.messages);
     if (messages.length > 0) {
       rootSpan.setAttribute("langfuse.observation.input", JSON.stringify(messages));
@@ -685,7 +684,7 @@ async function processOpenAiHttpRequest(
       const content = resolveAgentResponseText(result);
       const usage = resolveChatCompletionUsage(result);
 
-      if (isTraceContentEnabled()) {
+      if (isContentCaptureEnabled()) {
         rootSpan.setAttribute("langfuse.observation.output", content);
       }
       // End root span deterministically on success so the output attribute is
@@ -820,7 +819,7 @@ async function processOpenAiHttpRequest(
         return;
       }
 
-      if (isTraceContentEnabled()) {
+      if (isContentCaptureEnabled()) {
         rootSpan.setAttributes({
           "langfuse.observation.output": resolveAgentResponseText(result),
         });
@@ -905,7 +904,7 @@ async function runAgentCommandWithGenerationSpan(
     requestMessages?: OpenAiChatMessage[];
   },
 ): Promise<Awaited<ReturnType<typeof agentCommandFromIngress>>> {
-  const traceContent = isTraceContentEnabled();
+  const traceContent = isContentCaptureEnabled();
   const generation = openaiCompatTracer.startSpan("openclaw.llm", {
     attributes: {
       "langfuse.observation.type": "GENERATION",

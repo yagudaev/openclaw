@@ -15,6 +15,7 @@ import {
 import type { ExecApprovalDecision } from "../infra/exec-approvals.js";
 import type { PluginHookAfterToolCallEvent } from "../plugins/types.js";
 import { normalizeOptionalLowercaseString, readStringValue } from "../shared/string-coerce.js";
+import { isContentCaptureEnabled } from "../tracing/content-gate.js";
 import type { ApplyPatchSummary } from "./apply-patch.js";
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
 import { parseExecApprovalResultText } from "./exec-approval-result.js";
@@ -143,10 +144,11 @@ function emitTrackedItemEvent(ctx: ToolHandlerContext, itemData: AgentItemEventD
   // which can contain PII, secrets, or large blobs. They are the only
   // content-bearing fields on this event — all other fields (itemId, name,
   // toolCallId, status, meta, title) are structural metadata and flow
-  // regardless. Mirror the `LANGFUSE_TRACE_CONTENT` gate used by the gateway
-  // span writer so the event bus does not leak content when tracing content
-  // is disabled — defense-in-depth for any future subscriber.
-  const gated = isTraceContentEnabled() ? itemData : stripItemEventContent(itemData);
+  // regardless. Mirror the content capture gate (OTEL_GENAI_CAPTURE_CONTENT,
+  // fallback: LANGFUSE_TRACE_CONTENT) used by the gateway span writer so the
+  // event bus does not leak content when tracing content is disabled —
+  // defense-in-depth for any future subscriber.
+  const gated = isContentCaptureEnabled() ? itemData : stripItemEventContent(itemData);
   emitAgentItemEvent({
     runId: ctx.params.runId,
     ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
@@ -156,13 +158,6 @@ function emitTrackedItemEvent(ctx: ToolHandlerContext, itemData: AgentItemEventD
     stream: "item",
     data: gated,
   });
-}
-
-// Opt-in content tracing. Mirror of `isTraceContentEnabled` in
-// `src/gateway/openai-http.ts` — kept local to avoid pulling the gateway
-// module into agent hot paths.
-function isTraceContentEnabled(): boolean {
-  return process.env.LANGFUSE_TRACE_CONTENT === "1";
 }
 
 function stripItemEventContent(itemData: AgentItemEventData): AgentItemEventData {

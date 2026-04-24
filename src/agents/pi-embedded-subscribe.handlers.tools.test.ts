@@ -960,18 +960,25 @@ describe("messaging tool media URL tracking", () => {
   });
 });
 
-describe("LANGFUSE_TRACE_CONTENT gate on item events", () => {
-  const originalEnv = process.env.LANGFUSE_TRACE_CONTENT;
+describe("content capture gate on item events", () => {
+  const originalPrimary = process.env.OTEL_GENAI_CAPTURE_CONTENT;
+  const originalLegacy = process.env.LANGFUSE_TRACE_CONTENT;
 
   afterEach(() => {
-    if (originalEnv === undefined) {
+    if (originalPrimary === undefined) {
+      delete process.env.OTEL_GENAI_CAPTURE_CONTENT;
+    } else {
+      process.env.OTEL_GENAI_CAPTURE_CONTENT = originalPrimary;
+    }
+    if (originalLegacy === undefined) {
       delete process.env.LANGFUSE_TRACE_CONTENT;
     } else {
-      process.env.LANGFUSE_TRACE_CONTENT = originalEnv;
+      process.env.LANGFUSE_TRACE_CONTENT = originalLegacy;
     }
   });
 
-  it("strips input/output from emitted item events when LANGFUSE_TRACE_CONTENT != '1'", async () => {
+  it("strips input/output from emitted item events when OTEL_GENAI_CAPTURE_CONTENT != '1'", async () => {
+    delete process.env.OTEL_GENAI_CAPTURE_CONTENT;
     delete process.env.LANGFUSE_TRACE_CONTENT;
     const { ctx, onAgentEvent } = createTestContext();
 
@@ -998,8 +1005,9 @@ describe("LANGFUSE_TRACE_CONTENT gate on item events", () => {
     }
   });
 
-  it("passes input/output through when LANGFUSE_TRACE_CONTENT='1'", async () => {
-    process.env.LANGFUSE_TRACE_CONTENT = "1";
+  it("passes input/output through when OTEL_GENAI_CAPTURE_CONTENT='1'", async () => {
+    process.env.OTEL_GENAI_CAPTURE_CONTENT = "1";
+    delete process.env.LANGFUSE_TRACE_CONTENT;
     const { ctx, onAgentEvent } = createTestContext();
 
     await handleToolExecutionStart(ctx, {
@@ -1025,6 +1033,7 @@ describe("LANGFUSE_TRACE_CONTENT gate on item events", () => {
   });
 
   it("strips output from end-phase item events when gate is off", async () => {
+    delete process.env.OTEL_GENAI_CAPTURE_CONTENT;
     delete process.env.LANGFUSE_TRACE_CONTENT;
     const { ctx, onAgentEvent } = createTestContext();
 
@@ -1067,7 +1076,8 @@ describe("LANGFUSE_TRACE_CONTENT gate on item events", () => {
   });
 
   it("passes output on end-phase item events when gate is on", async () => {
-    process.env.LANGFUSE_TRACE_CONTENT = "1";
+    process.env.OTEL_GENAI_CAPTURE_CONTENT = "1";
+    delete process.env.LANGFUSE_TRACE_CONTENT;
     const { ctx, onAgentEvent } = createTestContext();
 
     await handleToolExecutionStart(
@@ -1104,5 +1114,32 @@ describe("LANGFUSE_TRACE_CONTENT gate on item events", () => {
       });
     expect(endToolEvent).toBeDefined();
     expect(endToolEvent!.data.output).toBeDefined();
+  });
+
+  it("honors deprecated LANGFUSE_TRACE_CONTENT fallback when OTEL_GENAI_CAPTURE_CONTENT is unset", async () => {
+    delete process.env.OTEL_GENAI_CAPTURE_CONTENT;
+    process.env.LANGFUSE_TRACE_CONTENT = "1";
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(ctx, {
+      type: "tool_execution_start",
+      toolName: "mcp__openclaw__browser",
+      toolCallId: "tool-legacy-1",
+      args: { url: "https://example.com" },
+    });
+
+    const toolItemStart = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .find((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return (
+          !!evt &&
+          typeof evt === "object" &&
+          (evt as { stream?: unknown }).stream === "item" &&
+          (evt as { data?: { phase?: unknown; kind?: unknown } }).data?.kind === "tool" &&
+          (evt as { data?: { phase?: unknown; kind?: unknown } }).data?.phase === "start"
+        );
+      });
+    expect(toolItemStart).toBeDefined();
+    expect(toolItemStart!.data.input).toEqual({ url: "https://example.com" });
   });
 });

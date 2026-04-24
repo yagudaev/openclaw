@@ -11,7 +11,8 @@
 //      `JSON.stringify` allocates a ~50 MB string before any truncation.
 //      Guard with an early raw-size check and emit a fixed placeholder
 //      instead of allocating the full string.
-//   3. LANGFUSE_TRACE_CONTENT gate: structural metadata always flows, but
+//   3. Content capture gate (OTEL_GENAI_CAPTURE_CONTENT, fallback:
+//      LANGFUSE_TRACE_CONTENT): structural metadata always flows, but
 //      content-bearing attrs (input/output) are suppressed by default. The
 //      gate lives in the caller; this module is content-agnostic.
 
