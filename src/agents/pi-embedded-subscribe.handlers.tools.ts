@@ -1,4 +1,5 @@
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
+import { buildToolPayloadAttribute } from "../gateway/openai-http.tool-payload.js";
 import type {
   AgentApprovalEventData,
   AgentCommandOutputEventData,
@@ -75,6 +76,8 @@ type ToolStartRecord = {
   startTime: number;
   args: unknown;
 };
+
+type ToolStreamContentField = "args" | "partialResult" | "result";
 
 /** Track tool execution start data for after_tool_call hook. */
 const toolStartData = new Map<string, ToolStartRecord>();
@@ -166,6 +169,25 @@ function stripItemEventContent(itemData: AgentItemEventData): AgentItemEventData
   }
   const { input: _input, output: _output, ...rest } = itemData;
   return rest;
+}
+
+export function buildToolStreamData(
+  base: Record<string, unknown>,
+  content?: { field: ToolStreamContentField; value: unknown },
+): Record<string, unknown> {
+  const data = { ...base };
+  if (!content || !isContentCaptureEnabled()) {
+    return data;
+  }
+  const attrs = buildToolPayloadAttribute(content.value);
+  if (!attrs) {
+    return data;
+  }
+  data[content.field] = attrs.value;
+  if (attrs.truncated) {
+    data[`${content.field}Truncated`] = true;
+  }
+  return data;
 }
 
 function readToolResultDetailsRecord(result: unknown): Record<string, unknown> | undefined {
@@ -627,12 +649,14 @@ export function handleToolExecutionStart(
     emitAgentEvent({
       runId: ctx.params.runId,
       stream: "tool",
-      data: {
-        phase: "start",
-        name: toolName,
-        toolCallId,
-        args: args as Record<string, unknown>,
-      },
+      data: buildToolStreamData(
+        {
+          phase: "start",
+          name: toolName,
+          toolCallId,
+        },
+        { field: "args", value: args },
+      ),
     });
     const itemData: AgentItemEventData = {
       itemId: buildToolItemId(toolCallId),
@@ -740,12 +764,14 @@ export function handleToolExecutionUpdate(
   emitAgentEvent({
     runId: ctx.params.runId,
     stream: "tool",
-    data: {
-      phase: "update",
-      name: toolName,
-      toolCallId,
-      partialResult: sanitized,
-    },
+    data: buildToolStreamData(
+      {
+        phase: "update",
+        name: toolName,
+        toolCallId,
+      },
+      { field: "partialResult", value: sanitized },
+    ),
   });
   const itemData: AgentItemEventData = {
     itemId: buildToolItemId(toolCallId),
@@ -909,14 +935,16 @@ export async function handleToolExecutionEnd(
   emitAgentEvent({
     runId: ctx.params.runId,
     stream: "tool",
-    data: {
-      phase: "result",
-      name: toolName,
-      toolCallId,
-      meta,
-      isError: isToolError,
-      result: sanitizedResult,
-    },
+    data: buildToolStreamData(
+      {
+        phase: "result",
+        name: toolName,
+        toolCallId,
+        meta,
+        isError: isToolError,
+      },
+      { field: "result", value: sanitizedResult },
+    ),
   });
   const endedAt = Date.now();
   const itemId = buildToolItemId(toolCallId);
