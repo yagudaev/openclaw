@@ -15,6 +15,7 @@ import {
 import type { ExecApprovalDecision } from "../infra/exec-approvals.js";
 import type { PluginHookAfterToolCallEvent } from "../plugins/types.js";
 import { normalizeOptionalLowercaseString, readStringValue } from "../shared/string-coerce.js";
+import { isContentCaptureEnabled } from "../tracing/content-gate.js";
 import type { ApplyPatchSummary } from "./apply-patch.js";
 import type { ExecToolDetails } from "./bash-tools.exec-types.js";
 import { parseExecApprovalResultText } from "./exec-approval-result.js";
@@ -139,15 +140,32 @@ function emitTrackedItemEvent(ctx: ToolHandlerContext, itemData: AgentItemEventD
     ctx.state.itemActiveIds.delete(itemData.itemId);
     ctx.state.itemCompletedCount += 1;
   }
+  // Content gate: `input` / `output` carry raw tool arguments and results
+  // which can contain PII, secrets, or large blobs. They are the only
+  // content-bearing fields on this event — all other fields (itemId, name,
+  // toolCallId, status, meta, title) are structural metadata and flow
+  // regardless. Mirror the content capture gate (OTEL_GENAI_CAPTURE_CONTENT,
+  // fallback: LANGFUSE_TRACE_CONTENT) used by the gateway span writer so the
+  // event bus does not leak content when tracing content is disabled —
+  // defense-in-depth for any future subscriber.
+  const gated = isContentCaptureEnabled() ? itemData : stripItemEventContent(itemData);
   emitAgentItemEvent({
     runId: ctx.params.runId,
     ...(ctx.params.sessionKey ? { sessionKey: ctx.params.sessionKey } : {}),
-    data: itemData,
+    data: gated,
   });
   void ctx.params.onAgentEvent?.({
     stream: "item",
-    data: itemData,
+    data: gated,
   });
+}
+
+function stripItemEventContent(itemData: AgentItemEventData): AgentItemEventData {
+  if (itemData.input === undefined && itemData.output === undefined) {
+    return itemData;
+  }
+  const { input: _input, output: _output, ...rest } = itemData;
+  return rest;
 }
 
 function readToolResultDetailsRecord(result: unknown): Record<string, unknown> | undefined {
@@ -626,6 +644,12 @@ export function handleToolExecutionStart(
       meta,
       toolCallId,
       startedAt,
+      // Capture raw tool arguments at start. The gateway serializes this onto
+      // the item span as `gen_ai.tool.input` so observability backends can see
+      // per-call arguments — vital for tools called multiple times in a run
+      // (e.g. four `mcp__openclaw__browser` calls that would otherwise be
+      // indistinguishable from metadata alone).
+      input: args,
     };
     emitTrackedItemEvent(ctx, itemData);
     // Best-effort typing signal; do not block tool summaries on slow emitters.
@@ -907,6 +931,10 @@ export async function handleToolExecutionEnd(
     toolCallId,
     startedAt: startData?.startTime,
     endedAt,
+    // Capture the sanitized tool result so the gateway can emit it as
+    // `gen_ai.tool.output` on the item span. Pair with the `input` captured
+    // at start to make per-call inspection possible in traces.
+    output: sanitizedResult,
     ...(isToolError && extractToolErrorMessage(sanitizedResult)
       ? { error: extractToolErrorMessage(sanitizedResult) }
       : {}),

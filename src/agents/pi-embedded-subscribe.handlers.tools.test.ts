@@ -1,5 +1,5 @@
 import type { AgentEvent } from "@mariozechner/pi-agent-core";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MessagingToolSend } from "./pi-embedded-messaging.types.js";
 import {
   handleToolExecutionEnd,
@@ -957,5 +957,189 @@ describe("messaging tool media URL tracking", () => {
 
     expect(ctx.state.messagingToolSentMediaUrls).toHaveLength(0);
     expect(ctx.state.pendingMessagingMediaUrls.has("tool-m3")).toBe(false);
+  });
+});
+
+describe("content capture gate on item events", () => {
+  const originalPrimary = process.env.OTEL_GENAI_CAPTURE_CONTENT;
+  const originalLegacy = process.env.LANGFUSE_TRACE_CONTENT;
+
+  afterEach(() => {
+    if (originalPrimary === undefined) {
+      delete process.env.OTEL_GENAI_CAPTURE_CONTENT;
+    } else {
+      process.env.OTEL_GENAI_CAPTURE_CONTENT = originalPrimary;
+    }
+    if (originalLegacy === undefined) {
+      delete process.env.LANGFUSE_TRACE_CONTENT;
+    } else {
+      process.env.LANGFUSE_TRACE_CONTENT = originalLegacy;
+    }
+  });
+
+  it("strips input/output from emitted item events when OTEL_GENAI_CAPTURE_CONTENT != '1'", async () => {
+    delete process.env.OTEL_GENAI_CAPTURE_CONTENT;
+    delete process.env.LANGFUSE_TRACE_CONTENT;
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(ctx, {
+      type: "tool_execution_start",
+      toolName: "mcp__openclaw__browser",
+      toolCallId: "tool-gated-1",
+      args: { secret: "do-not-leak" },
+    });
+
+    const itemEvents = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .filter((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return !!evt && typeof evt === "object" && (evt as { stream?: unknown }).stream === "item";
+      });
+    expect(itemEvents.length).toBeGreaterThan(0);
+    for (const evt of itemEvents) {
+      expect(evt.data.input).toBeUndefined();
+      expect(evt.data.output).toBeUndefined();
+      // Structural metadata must still flow.
+      expect(typeof evt.data.itemId).toBe("string");
+      expect(evt.data.name).toBe("mcp__openclaw__browser");
+      expect(evt.data.toolCallId).toBe("tool-gated-1");
+    }
+  });
+
+  it("passes input/output through when OTEL_GENAI_CAPTURE_CONTENT='1'", async () => {
+    process.env.OTEL_GENAI_CAPTURE_CONTENT = "1";
+    delete process.env.LANGFUSE_TRACE_CONTENT;
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(ctx, {
+      type: "tool_execution_start",
+      toolName: "mcp__openclaw__browser",
+      toolCallId: "tool-open-1",
+      args: { url: "https://example.com" },
+    });
+
+    const toolItemStart = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .find((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return (
+          !!evt &&
+          typeof evt === "object" &&
+          (evt as { stream?: unknown }).stream === "item" &&
+          (evt as { data?: { phase?: unknown; kind?: unknown } }).data?.kind === "tool" &&
+          (evt as { data?: { phase?: unknown; kind?: unknown } }).data?.phase === "start"
+        );
+      });
+    expect(toolItemStart).toBeDefined();
+    expect(toolItemStart!.data.input).toEqual({ url: "https://example.com" });
+  });
+
+  it("strips output from end-phase item events when gate is off", async () => {
+    delete process.env.OTEL_GENAI_CAPTURE_CONTENT;
+    delete process.env.LANGFUSE_TRACE_CONTENT;
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "read",
+        toolCallId: "tool-end-1",
+        args: { path: "/tmp/example.txt" },
+      } as never,
+    );
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "read",
+        toolCallId: "tool-end-1",
+        isError: false,
+        result: { content: [{ type: "text", text: "super-secret file contents" }] },
+      } as never,
+    );
+
+    const endEvents = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .filter((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return (
+          !!evt &&
+          typeof evt === "object" &&
+          (evt as { stream?: unknown }).stream === "item" &&
+          (evt as { data?: { phase?: unknown } }).data?.phase === "end"
+        );
+      });
+    expect(endEvents.length).toBeGreaterThan(0);
+    for (const evt of endEvents) {
+      expect(evt.data.output).toBeUndefined();
+      expect(evt.data.input).toBeUndefined();
+    }
+  });
+
+  it("passes output on end-phase item events when gate is on", async () => {
+    process.env.OTEL_GENAI_CAPTURE_CONTENT = "1";
+    delete process.env.LANGFUSE_TRACE_CONTENT;
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(
+      ctx as never,
+      {
+        type: "tool_execution_start",
+        toolName: "read",
+        toolCallId: "tool-end-2",
+        args: { path: "/tmp/example.txt" },
+      } as never,
+    );
+
+    await handleToolExecutionEnd(
+      ctx as never,
+      {
+        type: "tool_execution_end",
+        toolName: "read",
+        toolCallId: "tool-end-2",
+        isError: false,
+        result: { content: [{ type: "text", text: "hello" }] },
+      } as never,
+    );
+
+    const endToolEvent = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .find((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return (
+          !!evt &&
+          typeof evt === "object" &&
+          (evt as { stream?: unknown }).stream === "item" &&
+          (evt as { data?: { kind?: unknown; phase?: unknown } }).data?.kind === "tool" &&
+          (evt as { data?: { kind?: unknown; phase?: unknown } }).data?.phase === "end"
+        );
+      });
+    expect(endToolEvent).toBeDefined();
+    expect(endToolEvent!.data.output).toBeDefined();
+  });
+
+  it("honors deprecated LANGFUSE_TRACE_CONTENT fallback when OTEL_GENAI_CAPTURE_CONTENT is unset", async () => {
+    delete process.env.OTEL_GENAI_CAPTURE_CONTENT;
+    process.env.LANGFUSE_TRACE_CONTENT = "1";
+    const { ctx, onAgentEvent } = createTestContext();
+
+    await handleToolExecutionStart(ctx, {
+      type: "tool_execution_start",
+      toolName: "mcp__openclaw__browser",
+      toolCallId: "tool-legacy-1",
+      args: { url: "https://example.com" },
+    });
+
+    const toolItemStart = onAgentEvent.mock.calls
+      .map((call) => call[0])
+      .find((evt): evt is { stream: string; data: Record<string, unknown> } => {
+        return (
+          !!evt &&
+          typeof evt === "object" &&
+          (evt as { stream?: unknown }).stream === "item" &&
+          (evt as { data?: { phase?: unknown; kind?: unknown } }).data?.kind === "tool" &&
+          (evt as { data?: { phase?: unknown; kind?: unknown } }).data?.phase === "start"
+        );
+      });
+    expect(toolItemStart).toBeDefined();
+    expect(toolItemStart!.data.input).toEqual({ url: "https://example.com" });
   });
 });

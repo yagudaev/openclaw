@@ -31,6 +31,7 @@ import {
   normalizeLowercaseStringOrEmpty,
   normalizeOptionalString,
 } from "../shared/string-coerce.js";
+import { isContentCaptureEnabled } from "../tracing/content-gate.js";
 import { resolveAssistantStreamDeltaText } from "./agent-event-assistant-text.js";
 import {
   buildAgentMessageFromConversationEntries,
@@ -48,6 +49,7 @@ import {
   type AuthorizedGatewayHttpRequest,
 } from "./http-utils.js";
 import { normalizeInputHostnameAllowlist } from "./input-allowlist.js";
+import { buildToolPayloadAttribute } from "./openai-http.tool-payload.js";
 
 type OpenAiHttpOptions = {
   auth: ResolvedGatewayAuth;
@@ -507,12 +509,10 @@ function resolveIncludeUsageForStreaming(payload: OpenAiChatCompletionRequest): 
 
 const openaiCompatTracer = trace.getTracer("openclaw-gateway/openai-http");
 
-// Opt-in full-content export. Prompts + assistant outputs can contain PII or
-// secrets; gate content-bearing attributes behind an explicit flag rather than
-// sending everything to Langfuse by default.
-function isTraceContentEnabled(): boolean {
-  return process.env.LANGFUSE_TRACE_CONTENT === "1";
-}
+// Content capture gate (OTEL_GENAI_CAPTURE_CONTENT, fallback:
+// LANGFUSE_TRACE_CONTENT). Prompts + assistant outputs can contain PII or
+// secrets; content-bearing attributes are suppressed unless explicitly
+// opted in. See `../tracing/content-gate.ts`.
 
 export async function handleOpenAiHttpRequest(
   req: IncomingMessage,
@@ -597,7 +597,7 @@ async function processOpenAiHttpRequest(
   // tab shows the incoming chat payload (messages array) rather than a null.
   // The wrapping `openclaw.chat_completions` span represents the HTTP layer;
   // the LLM-specific work lives in the nested `openclaw.llm` generation.
-  if (isTraceContentEnabled()) {
+  if (isContentCaptureEnabled()) {
     const messages = asMessages(payload.messages);
     if (messages.length > 0) {
       rootSpan.setAttribute("langfuse.observation.input", JSON.stringify(messages));
@@ -684,7 +684,7 @@ async function processOpenAiHttpRequest(
       const content = resolveAgentResponseText(result);
       const usage = resolveChatCompletionUsage(result);
 
-      if (isTraceContentEnabled()) {
+      if (isContentCaptureEnabled()) {
         rootSpan.setAttribute("langfuse.observation.output", content);
       }
       // End root span deterministically on success so the output attribute is
@@ -819,7 +819,7 @@ async function processOpenAiHttpRequest(
         return;
       }
 
-      if (isTraceContentEnabled()) {
+      if (isContentCaptureEnabled()) {
         rootSpan.setAttributes({
           "langfuse.observation.output": resolveAgentResponseText(result),
         });
@@ -904,7 +904,7 @@ async function runAgentCommandWithGenerationSpan(
     requestMessages?: OpenAiChatMessage[];
   },
 ): Promise<Awaited<ReturnType<typeof agentCommandFromIngress>>> {
-  const traceContent = isTraceContentEnabled();
+  const traceContent = isContentCaptureEnabled();
   const generation = openaiCompatTracer.startSpan("openclaw.llm", {
     attributes: {
       "langfuse.observation.type": "GENERATION",
@@ -1065,9 +1065,13 @@ function handleItemEvent(params: {
           // OTel GenAI semantic conventions — also makes the span eligible for
           // LangfuseSpanProcessor's default `shouldExportSpan` filter (which
           // only exports spans carrying `gen_ai.*` attrs or coming from the
-          // Langfuse tracer scope).
+          // Langfuse tracer scope). We deliberately emit vendor-neutral
+          // `gen_ai.*` attrs for new data; `langfuse.*` attrs stay only where
+          // they already exist (back-compat for Langfuse ingest). No new
+          // `langfuse.*` sites going forward.
           "gen_ai.operation.name": isTool ? "execute_tool" : "workflow",
           ...(isTool && data.name ? { "gen_ai.tool.name": data.name } : {}),
+          ...(isTool && data.toolCallId ? { "gen_ai.tool.call_id": data.toolCallId } : {}),
           "langfuse.observation.type": resolveItemObservationType(data.kind),
           "openclaw.item.id": data.itemId,
           "openclaw.item.kind": data.kind,
@@ -1078,6 +1082,9 @@ function handleItemEvent(params: {
       },
       parentCtx,
     );
+    if (traceContent && isTool && data.input !== undefined) {
+      applyToolPayloadAttributes(span, "input", data.input);
+    }
     itemSpans.set(data.itemId, span);
     return;
   }
@@ -1086,16 +1093,45 @@ function handleItemEvent(params: {
     if (!span) {
       return;
     }
-    if (data.status === "failed" || data.status === "blocked") {
+    const isTool = resolveItemObservationType(data.kind) === "TOOL";
+    const isError = data.status === "failed" || data.status === "blocked";
+    if (isError) {
       span.setStatus({
         code: SpanStatusCode.ERROR,
         message: data.error ?? data.status,
       });
+      if (isTool) {
+        span.setAttribute("gen_ai.tool.error.type", data.status);
+        if (data.error) {
+          span.setAttribute("gen_ai.tool.error.message", data.error);
+        }
+      }
     }
-    if (traceContent && data.summary) {
-      span.setAttribute("langfuse.observation.output", data.summary);
+    if (traceContent) {
+      if (isTool && data.output !== undefined) {
+        applyToolPayloadAttributes(span, "output", data.output);
+      }
+      if (data.summary) {
+        span.setAttribute("langfuse.observation.output", data.summary);
+      }
     }
     span.end();
     itemSpans.delete(data.itemId);
+  }
+}
+
+// Apply a serialized + byte-truncated tool payload to the span as the
+// matching `gen_ai.tool.<slot>` attribute, plus a `.truncated=true` flag when
+// truncation occurred. Serialization, byte-safe truncation, and raw-size
+// guarding live in `openai-http.tool-payload.ts` so they can be unit tested
+// without a gateway server.
+function applyToolPayloadAttributes(span: Span, slot: "input" | "output", payload: unknown): void {
+  const attrs = buildToolPayloadAttribute(payload);
+  if (!attrs) {
+    return;
+  }
+  span.setAttribute(`gen_ai.tool.${slot}`, attrs.value);
+  if (attrs.truncated) {
+    span.setAttribute(`gen_ai.tool.${slot}.truncated`, true);
   }
 }

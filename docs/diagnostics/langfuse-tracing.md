@@ -23,7 +23,7 @@ Missing keys soft-disable tracing. The gateway still runs, no spans are emitted,
 
 Optional: `OTEL_SERVICE_NAME=openclaw-gateway` (the default). Override when running multiple gateways against the same Langfuse project so you can filter by service in the Langfuse UI.
 
-Optional: `LANGFUSE_TRACE_CONTENT=1`. Off by default. Prompts and assistant outputs can contain PII or secrets, so content-bearing attributes (`langfuse.observation.input` / `langfuse.observation.output`) are suppressed unless you explicitly opt in. Usage-details (tokens), model name, `http.*` attributes, and trace structure always export.
+Optional: `OTEL_GENAI_CAPTURE_CONTENT=1`. Off by default. Prompts and assistant outputs can contain PII or secrets, so content-bearing attributes (`langfuse.observation.input` / `langfuse.observation.output`) are suppressed unless you explicitly opt in. Usage-details (tokens), model name, `http.*` attributes, and trace structure always export. The legacy `LANGFUSE_TRACE_CONTENT=1` is still honored as a fallback when the new var is unset, so existing deployments keep working — prefer the vendor-neutral name going forward.
 
 ## What you'll see
 
