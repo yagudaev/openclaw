@@ -32,17 +32,22 @@ export type ToolPayloadAttributes = {
   truncated: boolean;
 };
 
+type SerializedToolPayload = {
+  value: string;
+  rawSizeGuarded: boolean;
+};
+
 // Serialize + byte-truncate a tool input/output payload for a
 // `gen_ai.tool.<slot>` span attribute. Returns `undefined` when there is
 // nothing to emit (null/undefined payload or serialization bailed out).
 // Never throws — tracing must not break the request path.
 export function buildToolPayloadAttribute(payload: unknown): ToolPayloadAttributes | undefined {
-  const serialized = serializeToolPayload(payload);
-  if (serialized === undefined) {
+  const serialized = serializeToolPayloadForAttribute(payload);
+  if (!serialized) {
     return undefined;
   }
-  const attrs = truncateUtf8(serialized, TOOL_PAYLOAD_MAX_BYTES);
-  return isRawPayloadTruncatedPlaceholder(serialized) ? { ...attrs, truncated: true } : attrs;
+  const attrs = truncateUtf8(serialized.value, TOOL_PAYLOAD_MAX_BYTES);
+  return serialized.rawSizeGuarded ? { ...attrs, truncated: true } : attrs;
 }
 
 // Best-effort serialization. Strings pass through so tool args/results that
@@ -54,17 +59,24 @@ export function buildToolPayloadAttribute(payload: unknown): ToolPayloadAttribut
 // size. If it exceeds `TOOL_PAYLOAD_RAW_MAX_BYTES` we bail with a
 // placeholder so a 50 MB payload does not allocate a 50 MB JSON string.
 export function serializeToolPayload(payload: unknown): string | undefined {
+  return serializeToolPayloadForAttribute(payload)?.value;
+}
+
+// Same serialization as the public helper, with internal bookkeeping so callers
+// can distinguish an intentionally raw-size-guarded placeholder from a real
+// tool payload that happens to contain the same text.
+function serializeToolPayloadForAttribute(payload: unknown): SerializedToolPayload | undefined {
   if (payload === undefined || payload === null) {
     return undefined;
   }
   if (typeof payload === "string") {
     if (Buffer.byteLength(payload, "utf8") > TOOL_PAYLOAD_RAW_MAX_BYTES) {
-      return buildTruncatedPlaceholder();
+      return { value: buildTruncatedPlaceholder(), rawSizeGuarded: true };
     }
-    return payload;
+    return { value: payload, rawSizeGuarded: false };
   }
   if (typeof payload === "number" || typeof payload === "boolean") {
-    return String(payload);
+    return { value: String(payload), rawSizeGuarded: false };
   }
   // Upfront guard for the common "huge binary tool result" shape — Buffer,
   // Node Buffer, and typed arrays. These expand dramatically under
@@ -73,7 +85,7 @@ export function serializeToolPayload(payload: unknown): string | undefined {
   // Bail early rather than relying on the replacer to trip mid-allocation.
   const directSize = estimateDirectByteSize(payload);
   if (directSize !== undefined && directSize > TOOL_PAYLOAD_RAW_MAX_BYTES) {
-    return buildTruncatedPlaceholder();
+    return { value: buildTruncatedPlaceholder(), rawSizeGuarded: true };
   }
   return stringifyWithSizeGuard(payload);
 }
@@ -106,14 +118,14 @@ export function truncateUtf8(str: string, maxBytes: number): ToolPayloadAttribut
 // the final serialized length — but it catches the worst case (a single
 // enormous string / deeply nested payload) without materializing the full
 // result first.
-function stringifyWithSizeGuard(payload: unknown): string {
+function stringifyWithSizeGuard(payload: unknown): SerializedToolPayload {
   // Shallow walk for Buffer/TypedArray children. `JSON.stringify` invokes
   // `toJSON()` on these values BEFORE the replacer sees the result, so a
   // nested `{ data: hugeBuffer }` would already have allocated a
   // multi-MiB integer array by the time the replacer runs. Catch that
   // case with a one-level-deep scan before entering `JSON.stringify`.
   if (containsHugeBinaryChild(payload)) {
-    return buildTruncatedPlaceholder();
+    return { value: buildTruncatedPlaceholder(), rawSizeGuarded: true };
   }
   let running = 0;
   try {
@@ -137,14 +149,14 @@ function stringifyWithSizeGuard(payload: unknown): string {
       return value;
     });
     if (encoded === undefined) {
-      return "[unserializable]";
+      return { value: "[unserializable]", rawSizeGuarded: false };
     }
-    return encoded;
+    return { value: encoded, rawSizeGuarded: false };
   } catch (err) {
     if (err instanceof RawPayloadTooLargeError) {
-      return buildTruncatedPlaceholder();
+      return { value: buildTruncatedPlaceholder(), rawSizeGuarded: true };
     }
-    return "[unserializable]";
+    return { value: "[unserializable]", rawSizeGuarded: false };
   }
 }
 
@@ -178,10 +190,6 @@ function containsHugeBinaryChild(payload: unknown): boolean {
 
 function buildTruncatedPlaceholder(): string {
   return `[truncated: raw payload exceeds ${TOOL_PAYLOAD_RAW_MAX_BYTES} bytes]`;
-}
-
-function isRawPayloadTruncatedPlaceholder(value: string): boolean {
-  return value === buildTruncatedPlaceholder();
 }
 
 // Best-effort byte-size estimate for payloads whose serialized JSON form

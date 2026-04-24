@@ -173,10 +173,10 @@ function stripItemEventContent(itemData: AgentItemEventData): AgentItemEventData
 
 export function buildToolStreamData(
   base: Record<string, unknown>,
-  content?: { field: ToolStreamContentField; value: unknown },
+  content: { field: ToolStreamContentField; value: unknown },
 ): Record<string, unknown> {
   const data = { ...base };
-  if (!content || !isContentCaptureEnabled()) {
+  if (!isContentCaptureEnabled()) {
     return data;
   }
   const attrs = buildToolPayloadAttribute(content.value);
